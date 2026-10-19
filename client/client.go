@@ -41,8 +41,6 @@ package client
 
 import (
 	"bytes"
-	"compress/flate"
-	"compress/gzip"
 	"context"
 	"crypto/sha256"
 	"crypto/tls"
@@ -65,6 +63,8 @@ import (
 	"github.com/klauspost/compress/zstd"
 	"github.com/sardanioss/httpcloak/fingerprint"
 	"github.com/sardanioss/httpcloak/internal/altsvc"
+	"github.com/sardanioss/httpcloak/internal/compress"
+	"github.com/sardanioss/httpcloak/internal/gunzip"
 	"github.com/sardanioss/httpcloak/pool"
 	"github.com/sardanioss/httpcloak/protocol"
 	"github.com/sardanioss/httpcloak/transport"
@@ -130,7 +130,9 @@ type Client struct {
 // Tries HTTP/3 first, then HTTP/2, then HTTP/1.1 as fallback
 func NewClient(presetName string, opts ...Option) *Client {
 	config := DefaultConfig()
-	config.Preset = presetName
+	if presetName != "" {
+		config.Preset = presetName
+	}
 	for _, opt := range opts {
 		opt(config)
 	}
@@ -1603,6 +1605,16 @@ func (c *Client) doHTTP2(ctx context.Context, host, port string, httpReq *http.R
 func (c *Client) doHTTP1(ctx context.Context, host, port string, httpReq *http.Request, timing *protocol.Timing, startTime time.Time) (*http.Response, string, error) {
 	firstByteTime := time.Now()
 
+	// Chromium sends no priority header on HTTP/1.1 (see
+	// SendsPriorityOverHTTP1). The request may go on to another protocol
+	// after this attempt, so strip it from a copy.
+	if c.preset != nil && !c.preset.SendsPriorityOverHTTP1() &&
+		(httpReq.Header.Get("Priority") != "" || len(httpReq.Header["priority"]) > 0) {
+		httpReq = httpReq.Clone(httpReq.Context())
+		httpReq.Header.Del("Priority")
+		delete(httpReq.Header, "priority")
+	}
+
 	resp, err := c.h1Transport.RoundTrip(httpReq)
 	if err != nil {
 		return nil, "", fmt.Errorf("HTTP/1.1 request failed: %w", err)
@@ -2002,6 +2014,7 @@ func applyModeHeaders(httpReq *http.Request, preset *fingerprint.Preset, req *Re
 	default:
 		applyNavigationModeHeaders(httpReq, preset, req)
 	}
+	applyTablePriority(httpReq, preset)
 
 	// Apply user custom headers. User wins over mode defaults — they can project
 	// any intent they want, including deliberate incoherence for site testing.
@@ -2146,11 +2159,10 @@ func applyNavigationModeHeaders(httpReq *http.Request, preset *fingerprint.Prese
 	}
 
 	// Content negotiation — use preset values, fall back to Chrome defaults
-	if v, ok := preset.Headers["Accept"]; ok {
-		httpReq.Header.Set("Accept", v)
-	} else {
-		httpReq.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7")
-	}
+	// preset.Headers only ever holds the values block (sec-ch-ua), so the old
+	// lookup here never found an Accept and always fell back to a hardcoded
+	// one. The navigation Accept lives in the header order.
+	httpReq.Header.Set("Accept", preset.ResolveNavigationAccept())
 	if v, ok := preset.Headers["Accept-Encoding"]; ok {
 		httpReq.Header.Set("Accept-Encoding", v)
 	} else {
@@ -2250,7 +2262,7 @@ func applyNoCorsHeaders(httpReq *http.Request, preset *fingerprint.Preset, req *
 	case "style":
 		httpReq.Header.Set("Accept", "text/css,*/*;q=0.1")
 	case "image":
-		httpReq.Header.Set("Accept", "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8")
+		httpReq.Header.Set("Accept", preset.ResolveImageAccept())
 	default: // "script", "empty", etc.
 		httpReq.Header.Set("Accept", "*/*")
 	}
@@ -2268,7 +2280,29 @@ func applyNoCorsHeaders(httpReq *http.Request, preset *fingerprint.Preset, req *
 	// NO Origin header (no-cors doesn't send Origin)
 	// NO Sec-Fetch-User (only for navigation)
 	// NO Upgrade-Insecure-Requests (only for navigation)
-	// NO Priority header by default (Chrome doesn't send it for most script loads)
+	// The priority header comes from the preset's table, in applyTablePriority.
+}
+
+// applyTablePriority sets the priority header the preset's browser sends for
+// the request's Sec-Fetch-Dest, or removes it where that browser sends none,
+// the way the transport's header pipeline does. The modes above used to
+// hardcode Chrome's values, so a Firefox preset sent Chrome's headers, and
+// no-cors requests sent none at all, where Chrome sends u=0 on a stylesheet,
+// u=1 on a script and u=2, i on an image. A dest the table does not know
+// keeps whatever the mode set. User headers are applied after this and win.
+func applyTablePriority(httpReq *http.Request, preset *fingerprint.Preset) {
+	if !preset.H2HasPriorityTable() {
+		return
+	}
+	_, _, hv, ok := preset.H2PriorityFor(httpReq.Header.Get("Sec-Fetch-Dest"))
+	if !ok {
+		return
+	}
+	if hv == "" {
+		httpReq.Header.Del("Priority")
+		return
+	}
+	httpReq.Header.Set("Priority", hv)
 }
 
 // detectSecFetchSiteForMode determines the Sec-Fetch-Site header value
@@ -2369,12 +2403,7 @@ func applyOrganicJitter(req *http.Request) {
 func decompress(data []byte, encoding string) ([]byte, error) {
 	switch strings.ToLower(encoding) {
 	case "gzip":
-		reader, err := gzip.NewReader(bytes.NewReader(data))
-		if err != nil {
-			return nil, err
-		}
-		defer reader.Close()
-		return io.ReadAll(reader)
+		return gunzip.Bytes(data)
 
 	case "br":
 		reader := brotli.NewReader(bytes.NewReader(data))
@@ -2389,9 +2418,8 @@ func decompress(data []byte, encoding string) ([]byte, error) {
 		return io.ReadAll(decoder)
 
 	case "deflate":
-		reader := flate.NewReader(bytes.NewReader(data))
-		defer reader.Close()
-		return io.ReadAll(reader)
+		// zlib-framed (RFC 9110) or raw, decided the way Chrome decides.
+		return compress.InflateDeflate(data)
 
 	case "", "identity":
 		return data, nil

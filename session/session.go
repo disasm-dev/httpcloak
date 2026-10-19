@@ -224,7 +224,9 @@ func NewSessionWithOptions(id string, config *protocol.SessionConfig, opts *Sess
 	} else if config.ForceHTTP3 {
 		t.SetProtocol(transport.ProtocolHTTP3)
 	} else if config.DisableHTTP3 {
-		t.SetProtocol(transport.ProtocolHTTP2)
+		// Auto mode without HTTP/3, not forced HTTP/2: forcing HTTP/2 lost
+		// the fallback to HTTP/1.1 for servers that only offer that (#121).
+		t.SetDisableHTTP3(true)
 	}
 
 	// Set IPv4 preference
@@ -2163,7 +2165,7 @@ func (s *Session) Marshal() ([]byte, error) {
 	config := s.Config
 	if config == nil {
 		config = &protocol.SessionConfig{
-			Preset: "chrome-146",
+			Preset: "chrome-latest",
 		}
 	}
 
@@ -2355,7 +2357,7 @@ func UnmarshalSessionWithOptions(data []byte, opts *SessionLoadOptions) (*Sessio
 	config := state.Config
 	if config == nil {
 		config = &protocol.SessionConfig{
-			Preset: "chrome-146",
+			Preset: "chrome-latest",
 		}
 	}
 	opts.applyTo(config)
@@ -2391,7 +2393,7 @@ func unmarshalSessionV4(data []byte, opts *SessionLoadOptions) (*Session, error)
 	config := state.Config
 	if config == nil {
 		config = &protocol.SessionConfig{
-			Preset: "chrome-146",
+			Preset: "chrome-latest",
 		}
 	}
 	opts.applyTo(config)

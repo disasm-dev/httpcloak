@@ -640,7 +640,11 @@ func GetECHDNSServers() []string {
 // FetchECHConfigs fetches ECH configs from DNS HTTPS records for the given hostname.
 // Returns nil if no ECH configs are available (this is not an error).
 func FetchECHConfigs(ctx context.Context, hostname string) ([]byte, error) {
-	if e := lookupHTTPSRecord(ctx, hostname); e != nil {
+	e, err := lookupHTTPSRecord(ctx, hostname)
+	if err != nil {
+		return nil, err
+	}
+	if e != nil {
 		return e.ConfigList, nil
 	}
 	return nil, nil // No ECH available is not an error
@@ -659,13 +663,21 @@ func FetchECHConfigs(ctx context.Context, hostname string) ([]byte, error) {
 // It shares the cache and the query with FetchECHConfigs: one HTTPS lookup
 // answers both.
 func AdvertisesH3(ctx context.Context, hostname string) bool {
-	e := lookupHTTPSRecord(ctx, hostname)
+	e, _ := lookupHTTPSRecord(ctx, hostname)
 	return e != nil && e.H3
 }
 
 // lookupHTTPSRecord returns the cached answer to hostname's HTTPS query,
-// querying DNS on a miss, or nil when there is no usable answer.
-func lookupHTTPSRecord(ctx context.Context, hostname string) *ECHEntry {
+// querying DNS on a miss, or nil when there is no usable answer. The error is
+// only ever the caller's own cancellation.
+func lookupHTTPSRecord(ctx context.Context, hostname string) (*ECHEntry, error) {
+	// An IP literal has no HTTPS record to look up, and asking a resolver for
+	// one sends the address out in a query that should never have left the
+	// machine; it also cost 200 to 600ms on the first dial to each address.
+	if net.ParseIP(strings.Trim(hostname, "[]")) != nil {
+		return nil, nil
+	}
+
 	// Check cache first. A fresh entry may be POSITIVE (has an ECH config) or
 	// NEGATIVE (ConfigList == nil, meaning "this host has no ECH"). Both short-
 	// circuit here, so a no-ECH host is not re-queried on every dial.
@@ -674,13 +686,17 @@ func lookupHTTPSRecord(ctx context.Context, hostname string) *ECHEntry {
 	echCacheMu.RUnlock()
 
 	if exists && time.Now().Before(entry.ExpiresAt) {
-		return entry
+		return entry, nil
 	}
 
 	// Collapse concurrent dials to the same host into one DNS query — the others
 	// wait and share the result — so a burst of H3 connections doesn't fire N
-	// parallel HTTPS lookups (each up to ~1.5s where UDP/53 is filtered).
-	v, err, _ := echSF.Do(hostname, func() (interface{}, error) {
+	// parallel HTTPS lookups (each up to ~1.5s where UDP/53 is filtered). As in
+	// Lookup, each caller waits on its own ctx, so a cancelled dial stops
+	// waiting at once, and the shared query runs detached from the caller that
+	// started it, so that caller's cancellation cannot stop it moving on to the
+	// next server for the others.
+	ch := echSF.DoChan(hostname, func() (interface{}, error) {
 		// Re-check under the flight: another goroutine may have populated a fresh
 		// entry while we waited for the single-flight slot.
 		echCacheMu.RLock()
@@ -690,7 +706,9 @@ func lookupHTTPSRecord(ctx context.Context, hostname string) *ECHEntry {
 			return e, nil
 		}
 
-		fresh, qerr := queryHTTPSRecord(ctx, hostname)
+		queryCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), resolveLookupTimeout)
+		defer cancel()
+		fresh, qerr := queryHTTPSRecord(queryCtx, hostname)
 		if qerr != nil {
 			// On DNS failure (including all-servers-SERVFAIL, now surfaced as an
 			// error rather than a bogus success) serve the expired config only
@@ -709,10 +727,16 @@ func lookupHTTPSRecord(ctx context.Context, hostname string) *ECHEntry {
 		echStore(hostname, fresh)
 		return fresh, nil
 	})
-	if err != nil || v == nil {
-		return nil
+	var res singleflight.Result
+	select {
+	case res = <-ch:
+	case <-ctx.Done():
+		return nil, ctx.Err()
 	}
-	return v.(*ECHEntry)
+	if res.Err != nil || res.Val == nil {
+		return nil, nil
+	}
+	return res.Val.(*ECHEntry), nil
 }
 
 // queryHTTPSRecord queries hostname's HTTPS records and returns what the cache

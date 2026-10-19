@@ -17,7 +17,8 @@ import (
 // Services IDs were dropped and none added: d6790902, d6790903, d6790909 and
 // d679090e.
 //
-// The order below is canonical only; every capture carried a different one.
+// The order below is only a fixture; which order goes out is per version (see
+// trust_anchors_order_test.go).
 var chrome152Anchors = []string{
 	"82df130201", "82df130206", "82df13020d", "82df13020e", "82df13020f",
 	"82df130212", "82df130213", "82df130214",
@@ -52,12 +53,16 @@ func tailSpec() []tls.TLSExtension {
 	}
 }
 
-// On an unpermuted spec the extension lands ahead of the trailing run that may
-// not move. GREASE brackets the list, padding sizes the record and RFC 8446
-// 4.2.11 puts pre_shared_key last.
+// The extension lands ahead of the trailing run that may not move.
+//
+// GREASE brackets the list, padding sizes the record and RFC 8446 4.2.11 puts
+// pre_shared_key last, so anything appended after those is pinned to the final
+// slot. BoringSSL marks trust_anchors out_compressible, which means it takes
+// part in the ordinary extension permutation like any other, and it cannot do
+// that from a pinned slot.
 func TestApplyTrustAnchorsInsertsBeforeThePinnedTail(t *testing.T) {
 	exts := tailSpec()
-	ApplyTrustAnchors(&exts, anchorBytes(t), false)
+	ApplyTrustAnchors(&exts, anchorBytes(t))
 
 	if len(exts) != 7 {
 		t.Fatalf("got %d extensions, want 7", len(exts))
@@ -68,9 +73,15 @@ func TestApplyTrustAnchorsInsertsBeforeThePinnedTail(t *testing.T) {
 			at = i
 		}
 	}
-	if at != 4 {
-		t.Fatalf("trust_anchors landed at index %d, want 4, ahead of the "+
-			"trailing GREASE and padding", at)
+	// Anywhere in the movable span, never ahead of the leading GREASE and
+	// never inside the pinned tail. The exact slot is random, since Chrome
+	// permutes this extension with the rest.
+	if at < 1 || at > 4 {
+		t.Fatalf("trust_anchors landed at index %d, want 1..4, between the "+
+			"leading GREASE and the trailing GREASE and padding", at)
+	}
+	if _, ok := exts[0].(*tls.UtlsGREASEExtension); !ok {
+		t.Error("the leading GREASE extension moved")
 	}
 	if _, ok := exts[5].(*tls.UtlsGREASEExtension); !ok {
 		t.Error("the trailing GREASE extension moved")
@@ -80,97 +91,12 @@ func TestApplyTrustAnchorsInsertsBeforeThePinnedTail(t *testing.T) {
 	}
 }
 
-// pre_shared_key is pinned last too, so the extension goes ahead of it, and a
-// permuted spec never moves it either.
+// pre_shared_key is pinned last too, so the extension goes ahead of it.
 func TestApplyTrustAnchorsRespectsPreSharedKey(t *testing.T) {
-	for _, permute := range []bool{false, true} {
-		for i := 0; i < 50; i++ {
-			exts := append(tailSpec(), &tls.FakePreSharedKeyExtension{})
-			ApplyTrustAnchors(&exts, anchorBytes(t), permute)
-			if _, ok := exts[len(exts)-1].(*tls.FakePreSharedKeyExtension); !ok {
-				t.Fatalf("permute=%v: pre_shared_key is no longer last, which RFC 8446 4.2.11 requires", permute)
-			}
-		}
-	}
-}
-
-// On a permuted spec the extension takes any movable slot with equal odds,
-// and the invariant extensions stay where they were. tailSpec has three
-// movable extensions, so four slots, indices 1 to 4.
-func TestApplyTrustAnchorsPermutedTakesAnyMovableSlot(t *testing.T) {
-	const draws = 4000
-	counts := map[int]int{}
-	for i := 0; i < draws; i++ {
-		exts := tailSpec()
-		ApplyTrustAnchors(&exts, anchorBytes(t), true)
-		for j, e := range exts {
-			if _, ok := e.(*tls.TrustAnchorsExtension); ok {
-				counts[j]++
-			}
-		}
-		if _, ok := exts[0].(*tls.UtlsGREASEExtension); !ok {
-			t.Fatal("the leading GREASE extension moved")
-		}
-		if _, ok := exts[len(exts)-2].(*tls.UtlsGREASEExtension); !ok {
-			t.Fatal("the trailing GREASE extension moved")
-		}
-		if _, ok := exts[len(exts)-1].(*tls.UtlsPaddingExtension); !ok {
-			t.Fatal("padding is no longer last")
-		}
-	}
-	for slot := 1; slot <= 4; slot++ {
-		// 1000 expected; the bounds are more than seven standard deviations out.
-		if n := counts[slot]; n < 800 || n > 1200 {
-			t.Errorf("slot %d took the extension %d times in %d, want about %d; all: %v",
-				slot, n, draws, draws/4, counts)
-		}
-	}
-}
-
-// The spec Chrome 152 is actually built from: every one of the n+1 places
-// among the movable extensions comes up, the last no more than the others.
-// Before, it was the last every time, which a real Chrome hello matches one
-// time in seventeen and three hellos rule out.
-func TestChrome152TrustAnchorsPermuteWithTheRest(t *testing.T) {
-	p := Get("chrome-152-windows")
-	if p == nil || len(p.TrustAnchors) == 0 {
-		t.Fatal("chrome-152-windows preset missing or without trust anchors")
-	}
-	if !tls.PermutesExtensions(p.ClientHelloID) {
-		t.Fatalf("%s/%s is not a permuting ClientHelloID", p.ClientHelloID.Client, p.ClientHelloID.Version)
-	}
-	const draws = 3000
-	var counts []int
-	for i := 0; i < draws; i++ {
-		spec, err := SpecForWithAnchors(p.ClientHelloID, 0, p.SignatureAlgorithms, p.TrustAnchors)
-		if err != nil {
-			t.Fatal(err)
-		}
-		rank, movable := -1, 0
-		for _, e := range spec.Extensions {
-			if tls.IsPositionInvariantExtension(e) {
-				continue
-			}
-			if _, ok := e.(*tls.TrustAnchorsExtension); ok {
-				rank = movable
-			}
-			movable++
-		}
-		if rank < 0 {
-			t.Fatal("the spec carries no trust_anchors extension")
-		}
-		if counts == nil {
-			counts = make([]int, movable)
-		}
-		counts[rank]++
-	}
-	t.Logf("%d movable slots, draws per slot: %v", len(counts), counts)
-	want := draws / len(counts)
-	for rank, n := range counts {
-		if n < want/2 || n > want*3/2 {
-			t.Errorf("trust_anchors sat at movable rank %d %d times in %d, want about %d; all: %v",
-				rank, n, draws, want, counts)
-		}
+	exts := append(tailSpec(), &tls.FakePreSharedKeyExtension{})
+	ApplyTrustAnchors(&exts, anchorBytes(t))
+	if _, ok := exts[len(exts)-1].(*tls.FakePreSharedKeyExtension); !ok {
+		t.Fatal("pre_shared_key is no longer last, which RFC 8446 4.2.11 requires")
 	}
 }
 
@@ -182,7 +108,7 @@ func TestApplyTrustAnchorsReplacesRatherThanDuplicating(t *testing.T) {
 		&tls.TrustAnchorsExtension{TrustAnchors: [][]byte{{0x01}}},
 	}, exts[3:]...)...)
 
-	ApplyTrustAnchors(&exts, anchorBytes(t), false)
+	ApplyTrustAnchors(&exts, anchorBytes(t))
 
 	var found int
 	for _, e := range exts {
@@ -202,7 +128,7 @@ func TestApplyTrustAnchorsReplacesRatherThanDuplicating(t *testing.T) {
 // An empty list is a no-op, so no preset starts sending the extension.
 func TestApplyTrustAnchorsEmptyIsANoOp(t *testing.T) {
 	exts := tailSpec()
-	ApplyTrustAnchors(&exts, nil, true)
+	ApplyTrustAnchors(&exts, nil)
 	if len(exts) != 6 {
 		t.Fatalf("an empty list changed the spec: %d extensions, want 6", len(exts))
 	}

@@ -202,7 +202,7 @@ func TestGroupByPriority_Empty(t *testing.T) {
 }
 
 func TestBuildSubresourceHeaders_CSS(t *testing.T) {
-	headers := buildSubresourceHeaders(resourceCSS, "https://example.com/page", "https://example.com/style.css")
+	headers := buildSubresourceHeaders(nil, resourceCSS, "https://example.com/page", "https://example.com/style.css")
 
 	assertHeader(t, headers, "Accept", "text/css,*/*;q=0.1")
 	assertHeader(t, headers, "Sec-Fetch-Mode", "no-cors")
@@ -213,7 +213,7 @@ func TestBuildSubresourceHeaders_CSS(t *testing.T) {
 }
 
 func TestBuildSubresourceHeaders_JS(t *testing.T) {
-	headers := buildSubresourceHeaders(resourceJS, "https://example.com/page", "https://example.com/app.js")
+	headers := buildSubresourceHeaders(nil, resourceJS, "https://example.com/page", "https://example.com/app.js")
 
 	assertHeader(t, headers, "Accept", "*/*")
 	assertHeader(t, headers, "Sec-Fetch-Mode", "no-cors")
@@ -222,7 +222,7 @@ func TestBuildSubresourceHeaders_JS(t *testing.T) {
 }
 
 func TestBuildSubresourceHeaders_Image(t *testing.T) {
-	headers := buildSubresourceHeaders(resourceImage, "https://example.com/page", "https://example.com/logo.png")
+	headers := buildSubresourceHeaders(nil, resourceImage, "https://example.com/page", "https://example.com/logo.png")
 
 	assertHeader(t, headers, "Accept", "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8")
 	assertHeader(t, headers, "Sec-Fetch-Mode", "no-cors")
@@ -231,7 +231,7 @@ func TestBuildSubresourceHeaders_Image(t *testing.T) {
 }
 
 func TestBuildSubresourceHeaders_Font(t *testing.T) {
-	headers := buildSubresourceHeaders(resourceFont, "https://example.com/page", "https://example.com/font.woff2")
+	headers := buildSubresourceHeaders(nil, resourceFont, "https://example.com/page", "https://example.com/font.woff2")
 
 	assertHeader(t, headers, "Accept", "*/*")
 	assertHeader(t, headers, "Sec-Fetch-Mode", "cors")
@@ -240,12 +240,12 @@ func TestBuildSubresourceHeaders_Font(t *testing.T) {
 }
 
 func TestBuildSubresourceHeaders_CrossSite(t *testing.T) {
-	headers := buildSubresourceHeaders(resourceImage, "https://example.com/page", "https://cdn.other.com/img.png")
+	headers := buildSubresourceHeaders(nil, resourceImage, "https://example.com/page", "https://cdn.other.com/img.png")
 	assertHeader(t, headers, "Sec-Fetch-Site", "cross-site")
 }
 
 func TestBuildSubresourceHeaders_SameSite(t *testing.T) {
-	headers := buildSubresourceHeaders(resourceCSS, "https://www.example.com/page", "https://cdn.example.com/style.css")
+	headers := buildSubresourceHeaders(nil, resourceCSS, "https://www.example.com/page", "https://cdn.example.com/style.css")
 	assertHeader(t, headers, "Sec-Fetch-Site", "same-site")
 }
 
@@ -288,5 +288,34 @@ func assertHeader(t *testing.T, headers map[string][]string, key, want string) {
 	}
 	if vals[0] != want {
 		t.Errorf("header %q = %q, want %q", key, vals[0], want)
+	}
+}
+
+// A preset with a priority table gets its own browser's priority header on
+// warmup subresources rather than the fallback constants, which matched no
+// browser (Chrome sends u=0 on a stylesheet, u=2, i on an image).
+func TestBuildSubresourceHeadersUsesThePresetsPriorityTable(t *testing.T) {
+	cases := []struct {
+		preset string
+		typ    resourceType
+		want   string
+	}{
+		{"chrome-155-windows", resourceCSS, "u=0"},
+		{"chrome-155-windows", resourceImage, "u=2, i"},
+		{"chrome-155-windows", resourceJS, "u=1"},
+		{"firefox-148-windows", resourceCSS, "u=2"},
+		{"firefox-148-windows", resourceImage, "u=5, i"},
+		{"firefox-148-windows", resourceFont, ""},
+	}
+	for _, tc := range cases {
+		p := fingerprint.Get(tc.preset)
+		h := buildSubresourceHeaders(p, tc.typ, "https://example.com/", "https://example.com/x")
+		got := ""
+		if v := h["Priority"]; len(v) > 0 {
+			got = v[0]
+		}
+		if got != tc.want {
+			t.Errorf("%s type %d: priority %q, want %q", tc.preset, tc.typ, got, tc.want)
+		}
 	}
 }

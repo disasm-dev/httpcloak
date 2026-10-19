@@ -72,10 +72,10 @@ type TLSSpec struct {
 	// AllowBluntMimicry passes unknown extensions through verbatim instead of
 	// rejecting them. curl needs it for extension 22; without it the load fails
 	// with "unsupported extension 22".
-	RawClientHello    string `json:"raw_client_hello,omitempty"`
-	RawPSKClientHello string `json:"raw_psk_client_hello,omitempty"`
-	AllowBluntMimicry *bool  `json:"allow_blunt_mimicry,omitempty"`
-	RawPermuteExtensions *bool `json:"permute_raw_hello,omitempty"`
+	RawClientHello       string `json:"raw_client_hello,omitempty"`
+	RawPSKClientHello    string `json:"raw_psk_client_hello,omitempty"`
+	AllowBluntMimicry    *bool  `json:"allow_blunt_mimicry,omitempty"`
+	RawPermuteExtensions *bool  `json:"permute_raw_hello,omitempty"`
 
 	// PSKJA3 is a JA3 captured from a resuming connection, i.e. one whose
 	// extension list contains 41. It is the JA3-mode counterpart of
@@ -103,10 +103,17 @@ type TLSSpec struct {
 	// The list is a snapshot of a root store and moves independently of the
 	// browser version, so it lives here rather than in code. Empty means the
 	// extension is not sent.
-	TrustAnchors      []string `json:"trust_anchors,omitempty"`
-	PermuteExtensions *bool    `json:"permute_extensions,omitempty"`
-	RecordSizeLimit   *uint16  `json:"record_size_limit,omitempty"`
-	KeyShareCurves    *int     `json:"key_share_curves,omitempty"` // number of curves to send key shares for; nil/0 = 1
+	TrustAnchors []string `json:"trust_anchors,omitempty"`
+
+	// QUICTrustAnchorsShuffle reshuffles the trust_anchors list on every QUIC
+	// connection, as Chrome 152 and 153 did. From 154 Chrome sorts the list and
+	// sends it unchanged on both transports, so leave it false there. Inherited
+	// through based_on unless set.
+	QUICTrustAnchorsShuffle *bool `json:"quic_trust_anchors_shuffle,omitempty"`
+
+	PermuteExtensions *bool   `json:"permute_extensions,omitempty"`
+	RecordSizeLimit   *uint16 `json:"record_size_limit,omitempty"`
+	KeyShareCurves    *int    `json:"key_share_curves,omitempty"` // number of curves to send key shares for; nil/0 = 1
 }
 
 // JA3ExtrasSpec is the JSON representation of JA3Extras.
@@ -143,9 +150,9 @@ type HTTP2Spec struct {
 	PseudoOrder   []string           `json:"pseudo_order,omitempty"`
 
 	// HPACK config
-	HPACKHeaderOrder    []string `json:"hpack_header_order,omitempty"`
+	HPACKHeaderOrder            []string `json:"hpack_header_order,omitempty"`
 	HPACKHeaderOrderSubresource []string `json:"hpack_header_order_subresource,omitempty"`
-	HPACKIndexingPolicy *string  `json:"hpack_indexing_policy,omitempty"` // "chrome","never","always","default"
+	HPACKIndexingPolicy         *string  `json:"hpack_indexing_policy,omitempty"` // "chrome","never","always","default"
 	// HPACKRepresentation pins the HPACK representation per header name:
 	// "incremental", "without", "never" or "default". Override layer, empty
 	// for browser profiles, deltas only. See H2FingerprintConfig.
@@ -179,6 +186,15 @@ type HTTP2Spec struct {
 	// preset's static StreamWeight / StreamExclusive is used for every
 	// request (legacy single-weight behaviour).
 	PriorityTable map[string]ResourcePrioritySpec `json:"priority_table,omitempty"`
+
+	// PriorityModel is "chromium" or "table"; see
+	// H2FingerprintConfig.PriorityModel. Omitted derives it from
+	// stream_exclusive.
+	PriorityModel *string `json:"priority_model,omitempty"`
+
+	// PriorityOverHTTP1 sends the table's priority header on HTTP/1.1 too;
+	// see Preset.SendsPriorityOverHTTP1. Omitted derives it.
+	PriorityOverHTTP1 *bool `json:"priority_over_http1,omitempty"`
 }
 
 // ResourcePrioritySpec is the JSON shape of fingerprint.ResourcePriority.
@@ -186,9 +202,10 @@ type HTTP2Spec struct {
 // inherit zero values (urgency=0 → highest, incremental=false, emit_header=false)
 // which is rarely what a real preset wants — populate explicitly.
 type ResourcePrioritySpec struct {
-	Urgency     uint8 `json:"urgency"`
-	Incremental bool  `json:"incremental"`
-	EmitHeader  bool  `json:"emit_header"`
+	Urgency     uint8  `json:"urgency"`
+	Incremental bool   `json:"incremental"`
+	EmitHeader  bool   `json:"emit_header"`
+	Weight      uint16 `json:"weight,omitempty"` // 1-256; omitted = from the urgency
 }
 
 // HTTP2SettingSpec represents a single HTTP/2 SETTINGS frame entry.
@@ -233,6 +250,11 @@ type HeaderSpec struct {
 	UserAgent string            `json:"user_agent,omitempty"`
 	Values    map[string]string `json:"values,omitempty"`
 	Order     []HeaderPairSpec  `json:"order,omitempty"`
+
+	// ImageAccept is the Accept header for image loads. Navigation carries its
+	// Accept in Order, but image requests are built elsewhere and need their
+	// own value, which moves between Chrome versions (155 added image/jxl).
+	ImageAccept string `json:"image_accept,omitempty"`
 }
 
 // HeaderPairSpec is a key-value pair for ordered headers in JSON.
@@ -688,10 +710,18 @@ func applyTLS(p *Preset, spec *TLSSpec) error {
 		// Same reasoning as the JA3 branch below: the captured bytes are the
 		// whole TLS fingerprint, so leaving a ClientHelloID behind would let a
 		// stale inherited identity win at some branch further down.
+		//
+		// The QUIC identities are deliberately NOT cleared. A capture describes
+		// one transport, and which one it describes is a property of the bytes:
+		// a QUIC hello carries quic_transport_parameters and a TCP hello does
+		// not. Clearing them here threw away the only QUIC identity the preset
+		// had, on the strength of a capture that usually says nothing about
+		// QUIC, and the HTTP/3 transport then had nothing to build from and
+		// silently fell back to the QUIC stack's own default hello. Whether the
+		// capture applies to QUIC is decided per transport, in
+		// ResolveQUICClientHelloSpec, which is the only place that knows.
 		p.ClientHelloID = tls.ClientHelloID{}
 		p.PSKClientHelloID = tls.ClientHelloID{}
-		p.QUICClientHelloID = tls.ClientHelloID{}
-		p.QUICPSKClientHelloID = tls.ClientHelloID{}
 		p.JA3 = ""
 		p.PSKJA3 = ""
 		return nil
@@ -707,10 +737,13 @@ func applyTLS(p *Preset, spec *TLSSpec) error {
 		// PSKClientHelloID goes with them, which is correct: a PSK hello built
 		// from a named ClientHelloID would not match the JA3 the rest of the
 		// connection advertises. psk_ja3 is the JA3-mode route to resumption.
+		//
+		// The QUIC identities stay, for the reason given in the raw branch: a
+		// JA3 describes the transport it was captured on, and taking a TCP JA3
+		// as grounds to erase the preset's QUIC identity left HTTP/3 with
+		// nothing to build from.
 		p.ClientHelloID = tls.ClientHelloID{}
 		p.PSKClientHelloID = tls.ClientHelloID{}
-		p.QUICClientHelloID = tls.ClientHelloID{}
-		p.QUICPSKClientHelloID = tls.ClientHelloID{}
 		// Build JA3Extras from the spec
 		if spec.JA3ExtrasSpec != nil {
 			extras, err := buildJA3Extras(spec.JA3ExtrasSpec)
@@ -799,6 +832,9 @@ func applyTLS(p *Preset, spec *TLSSpec) error {
 		if len(spec.QUICSignatureAlgorithms) > 0 {
 			p.QUICSignatureAlgorithms = uint16sToSchemes(spec.QUICSignatureAlgorithms)
 		}
+	}
+	if spec.QUICTrustAnchorsShuffle != nil {
+		p.QUICTrustAnchorShuffle = *spec.QUICTrustAnchorsShuffle
 	}
 	if spec.TrustAnchors != nil {
 		anchors := make([][]byte, 0, len(spec.TrustAnchors))
@@ -1052,7 +1088,8 @@ func applyHTTP2(p *Preset, spec *HTTP2Spec) error {
 		spec.StreamPriorityMode != nil ||
 		spec.DisableCookieSplit != nil || spec.PriorityTable != nil ||
 		spec.DataFrameMaxSize != nil || spec.PrefacePingIdleMs != nil ||
-		spec.PrefacePingHangMs != nil || spec.IdlePingMs != nil {
+		spec.PrefacePingHangMs != nil || spec.IdlePingMs != nil ||
+		spec.PriorityModel != nil || spec.PriorityOverHTTP1 != nil {
 		if p.H2Config == nil {
 			p.H2Config = &H2FingerprintConfig{}
 		}
@@ -1117,8 +1154,16 @@ func applyHTTP2(p *Preset, spec *HTTP2Spec) error {
 					Urgency:     rps.Urgency,
 					Incremental: rps.Incremental,
 					EmitHeader:  rps.EmitHeader,
+					Weight:      rps.Weight,
 				}
 			}
+		}
+		if spec.PriorityModel != nil {
+			p.H2Config.PriorityModel = *spec.PriorityModel
+		}
+		if spec.PriorityOverHTTP1 != nil {
+			v := *spec.PriorityOverHTTP1
+			p.H2Config.PriorityOverHTTP1 = &v
 		}
 	}
 
@@ -1208,6 +1253,9 @@ func applyHTTP3(p *Preset, spec *HTTP3Spec) {
 func applyHeaders(p *Preset, spec *HeaderSpec) {
 	if spec.UserAgent != "" {
 		p.UserAgent = spec.UserAgent
+	}
+	if spec.ImageAccept != "" {
+		p.ImageAccept = spec.ImageAccept
 	}
 
 	// Merge values into Headers map
@@ -1367,6 +1415,32 @@ func validatePreset(p *Preset, spec *PresetSpec) error {
 		if spec.TLS.JA3ExtrasSpec != nil && spec.TLS.JA3 == "" {
 			return fmt.Errorf("ja3_extras requires ja3 to be set")
 		}
+		// With ja3_extras present, the top-level fields it would otherwise be
+		// built from are not read at all, so declaring both lost the top-level
+		// ones without a word, the same failure as #130 below.
+		if spec.TLS.JA3ExtrasSpec != nil && spec.TLS.JA3 != "" {
+			var ignored []string
+			for _, f := range []struct {
+				name string
+				set  bool
+			}{
+				{"signature_algorithms", len(spec.TLS.SignatureAlgorithms) > 0},
+				{"delegated_credential_algorithms", len(spec.TLS.DelegatedCredentialAlgorithms) > 0},
+				{"alpn", len(spec.TLS.ALPN) > 0},
+				{"cert_compression", len(spec.TLS.CertCompression) > 0},
+				{"permute_extensions", spec.TLS.PermuteExtensions != nil},
+				{"record_size_limit", spec.TLS.RecordSizeLimit != nil},
+				{"key_share_curves", spec.TLS.KeyShareCurves != nil},
+			} {
+				if f.set {
+					ignored = append(ignored, f.name)
+				}
+			}
+			if len(ignored) > 0 {
+				return fmt.Errorf("tls.%s would be ignored because ja3_extras is set; "+
+					"put them inside ja3_extras instead", strings.Join(ignored, ", tls."))
+			}
+		}
 		// TLS extension fields only apply in ja3 mode, with one exception.
 		//
 		// signature_algorithms is NOT one of them. applyTLS honours it on the
@@ -1377,11 +1451,40 @@ func validatePreset(p *Preset, spec *PresetSpec) error {
 		// override, so describing any Chrome 150 or later preset produced JSON
 		// the loader then refused. Its QUIC counterpart was never listed and
 		// has always been allowed.
-		hasExtFields := len(spec.TLS.ALPN) > 0 ||
-			len(spec.TLS.CertCompression) > 0 || spec.TLS.PermuteExtensions != nil ||
-			spec.TLS.RecordSizeLimit != nil
-		if hasExtFields && spec.TLS.JA3 == "" && spec.TLS.ClientHello != "" {
-			return fmt.Errorf("tls extension fields (alpn, cert_compression, permute_extensions, record_size_limit) only apply with ja3, not client_hello")
+		//
+		// The rest are read only when the same tls block declares ja3, and
+		// permute_extensions also on the raw path. Anywhere else they used to
+		// be dropped without a word: the guard here fired only when
+		// client_hello was set explicitly, so a preset inheriting its hello
+		// through based_on, or carrying a raw capture, loaded cleanly and went
+		// on the wire without the values it declared (#130). A preset that
+		// looks configured and is not is the worst kind of fingerprint bug,
+		// because every request still succeeds.
+		if spec.TLS.JA3 == "" {
+			var ignored []string
+			if len(spec.TLS.ALPN) > 0 {
+				ignored = append(ignored, "alpn")
+			}
+			if len(spec.TLS.CertCompression) > 0 {
+				ignored = append(ignored, "cert_compression")
+			}
+			if spec.TLS.RecordSizeLimit != nil {
+				ignored = append(ignored, "record_size_limit")
+			}
+			if spec.TLS.PermuteExtensions != nil && spec.TLS.RawClientHello == "" {
+				ignored = append(ignored, "permute_extensions")
+			}
+			if len(ignored) > 0 {
+				mode := "a client_hello inherited through based_on"
+				switch {
+				case spec.TLS.RawClientHello != "":
+					mode = "raw_client_hello, whose captured bytes already fix them"
+				case spec.TLS.ClientHello != "":
+					mode = "client_hello"
+				}
+				return fmt.Errorf("tls.%s only apply alongside ja3 in the same tls block, "+
+					"and would be ignored with %s", strings.Join(ignored, ", tls."), mode)
+			}
 		}
 	}
 
@@ -1403,6 +1506,22 @@ func validatePreset(p *Preset, spec *PresetSpec) error {
 				// valid
 			default:
 				return fmt.Errorf("invalid stream_priority_mode: %q (must be chrome/default)", *spec.HTTP2.StreamPriorityMode)
+			}
+		}
+
+		if spec.HTTP2.PriorityModel != nil {
+			switch *spec.HTTP2.PriorityModel {
+			case PriorityModelChromium, PriorityModelTable:
+			default:
+				return fmt.Errorf("invalid priority_model: %q (must be chromium/table)", *spec.HTTP2.PriorityModel)
+			}
+		}
+		for dest, rp := range spec.HTTP2.PriorityTable {
+			if rp.Urgency > 7 {
+				return fmt.Errorf("priority_table[%q].urgency %d is out of range (0-7)", dest, rp.Urgency)
+			}
+			if rp.Weight > 256 {
+				return fmt.Errorf("priority_table[%q].weight %d is out of range (1-256)", dest, rp.Weight)
 			}
 		}
 	}

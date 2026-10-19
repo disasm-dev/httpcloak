@@ -104,7 +104,7 @@ type LocalProxyConfig struct {
 	// Port to listen on (0 = auto-select)
 	Port int
 
-	// Browser fingerprint preset (default: chrome-146)
+	// Browser fingerprint preset (default: chrome-latest)
 	Preset string
 
 	// Request timeout
@@ -193,7 +193,7 @@ func WithProxySessionCache(backend transport.SessionCacheBackend, errorCallback 
 func StartLocalProxy(port int, opts ...LocalProxyOption) (*LocalProxy, error) {
 	config := &LocalProxyConfig{
 		Port:           port,
-		Preset:         "chrome-146",
+		Preset:         "chrome-latest",
 		Timeout:        30 * time.Second,
 		MaxConnections: 1000,
 	}
@@ -347,12 +347,12 @@ func (p *LocalProxy) Stats() map[string]interface{} {
 	p.sessionRegistryMu.RUnlock()
 
 	return map[string]interface{}{
-		"running":           p.running.Load(),
-		"port":              p.port,
-		"active_conns":      p.activeConns.Load(),
-		"total_requests":    p.totalReqs.Load(),
-		"preset":            p.preset,
-		"max_connections":   p.maxConnections,
+		"running":             p.running.Load(),
+		"port":                p.port,
+		"active_conns":        p.activeConns.Load(),
+		"total_requests":      p.totalReqs.Load(),
+		"preset":              p.preset,
+		"max_connections":     p.maxConnections,
 		"registered_sessions": sessionCount,
 	}
 }
@@ -630,7 +630,7 @@ func (p *LocalProxy) handleHTTPWithSession(ctx context.Context, clientConn net.C
 		Method:  req.Method,
 		URL:     targetURL,
 		Headers: headers,
-		Body:    req.Body,    // Streaming request body
+		Body:    req.Body, // Streaming request body
 		TLSOnly: tlsOnlyOverride,
 	}
 
@@ -807,7 +807,7 @@ func (p *LocalProxy) createProxyClient(proxyURL string) *http.Client {
 	}
 
 	transport := &http.Transport{
-		Proxy: http.ProxyURL(parsed),
+		Proxy:               http.ProxyURL(parsed),
 		MaxIdleConns:        10,
 		MaxIdleConnsPerHost: 2,
 		IdleConnTimeout:     30 * time.Second,

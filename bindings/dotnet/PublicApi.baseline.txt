@@ -8,7 +8,7 @@
 # shipped shape is missing, add a forwarding overload for it instead: see the
 # forwarders at the end of Session.cs, which carry the 1.6.8 and 1.7.0 shapes.
 #
-# 421 members.
+# 443 members.
 
 HttpCloak.Cookie.Domain : System.String
 HttpCloak.Cookie.Expires : System.String
@@ -167,6 +167,28 @@ HttpCloak.Presets.Chrome151IOS : System.String
 HttpCloak.Presets.Chrome151Linux : System.String
 HttpCloak.Presets.Chrome151MacOS : System.String
 HttpCloak.Presets.Chrome151Windows : System.String
+HttpCloak.Presets.Chrome152 : System.String
+HttpCloak.Presets.Chrome152Android : System.String
+HttpCloak.Presets.Chrome152IOS : System.String
+HttpCloak.Presets.Chrome152Linux : System.String
+HttpCloak.Presets.Chrome152MacOS : System.String
+HttpCloak.Presets.Chrome152Windows : System.String
+HttpCloak.Presets.Chrome153 : System.String
+HttpCloak.Presets.Chrome153Android : System.String
+HttpCloak.Presets.Chrome153Linux : System.String
+HttpCloak.Presets.Chrome153MacOS : System.String
+HttpCloak.Presets.Chrome153Windows : System.String
+HttpCloak.Presets.Chrome154 : System.String
+HttpCloak.Presets.Chrome154Android : System.String
+HttpCloak.Presets.Chrome154Linux : System.String
+HttpCloak.Presets.Chrome154MacOS : System.String
+HttpCloak.Presets.Chrome154Windows : System.String
+HttpCloak.Presets.Chrome155 : System.String
+HttpCloak.Presets.Chrome155Android : System.String
+HttpCloak.Presets.Chrome155IOS : System.String
+HttpCloak.Presets.Chrome155Linux : System.String
+HttpCloak.Presets.Chrome155MacOS : System.String
+HttpCloak.Presets.Chrome155Windows : System.String
 HttpCloak.Presets.ChromeLatest : System.String
 HttpCloak.Presets.ChromeLatestAndroid : System.String
 HttpCloak.Presets.ChromeLatestIos : System.String
@@ -418,6 +440,7 @@ HttpCloak.StreamResponse.Encoding : System.String
 HttpCloak.StreamResponse.GetContentStream(System.Int32) : System.IO.Stream
 HttpCloak.StreamResponse.GetHeader(System.String) : System.String
 HttpCloak.StreamResponse.GetHeaders(System.String) : System.String[]
+HttpCloak.StreamResponse.GetTrailer() : System.Collections.Generic.IReadOnlyDictionary<System.String, System.String[]>
 HttpCloak.StreamResponse.Headers : System.Collections.Generic.Dictionary<System.String, System.String[]>
 HttpCloak.StreamResponse.History : System.Collections.Generic.List<HttpCloak.RedirectInfo>
 HttpCloak.StreamResponse.Json() : T

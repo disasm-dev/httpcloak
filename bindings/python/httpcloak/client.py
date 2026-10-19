@@ -32,7 +32,18 @@ import platform
 import threading
 import time
 import uuid
-from ctypes import CFUNCTYPE, POINTER, c_char_p, c_int, c_int64, c_void_p, cast, cdll
+from ctypes import (
+    CFUNCTYPE,
+    POINTER,
+    addressof,
+    c_char_p,
+    c_int,
+    c_int64,
+    c_void_p,
+    cast,
+    cdll,
+    create_string_buffer,
+)
 from io import IOBase
 from pathlib import Path
 from typing import Any, BinaryIO, Dict, List, Optional, Sequence, Tuple, Union
@@ -161,7 +172,37 @@ class Preset:
     CHROME_LATEST_IOS = "chrome-latest-ios"
     CHROME_LATEST_ANDROID = "chrome-latest-android"
 
-    # Chrome 149 (desktop; wire fingerprint identical to 148)
+    # Chrome 153 (headers-only over 152; no iOS preset until one is captured)
+    CHROME_153 = "chrome-153"
+    CHROME_153_WINDOWS = "chrome-153-windows"
+    CHROME_153_LINUX = "chrome-153-linux"
+    CHROME_153_MACOS = "chrome-153-macos"
+    CHROME_153_ANDROID = "chrome-153-android"
+
+    # Chrome 154 (headers-only over 153)
+    CHROME_154 = "chrome-154"
+    CHROME_154_WINDOWS = "chrome-154-windows"
+    CHROME_154_LINUX = "chrome-154-linux"
+    CHROME_154_MACOS = "chrome-154-macos"
+    CHROME_154_ANDROID = "chrome-154-android"
+
+    # Chrome 155 (desktop and Android add image/jxl to Accept; TLS unchanged; iOS captured)
+    CHROME_155 = "chrome-155"
+    CHROME_155_WINDOWS = "chrome-155-windows"
+    CHROME_155_LINUX = "chrome-155-linux"
+    CHROME_155_MACOS = "chrome-155-macos"
+    CHROME_155_IOS = "chrome-155-ios"
+    CHROME_155_ANDROID = "chrome-155-android"
+
+    # Chrome 152 (trust anchors, plus a greased signature algorithm on TCP)
+    CHROME_152 = "chrome-152"
+    CHROME_152_WINDOWS = "chrome-152-windows"
+    CHROME_152_LINUX = "chrome-152-linux"
+    CHROME_152_MACOS = "chrome-152-macos"
+    CHROME_152_ANDROID = "chrome-152-android"
+    CHROME_152_IOS = "chrome-152-ios"
+
+    # Chrome 151 (headers only over 150)
     CHROME_151 = "chrome-151"
     CHROME_151_WINDOWS = "chrome-151-windows"
     CHROME_151_LINUX = "chrome-151-linux"
@@ -279,30 +320,17 @@ class Preset:
         """
         Return list of all built-in preset names known to this binding version.
 
+        Built from the constants above, each name once, so a new constant can
+        never be left out of it.
+
         For the authoritative live list (which may include custom presets loaded
         at runtime), call `httpcloak.available_presets()` instead.
         """
-        return [
-            cls.CHROME_LATEST, cls.CHROME_LATEST_WINDOWS, cls.CHROME_LATEST_LINUX,
-            cls.CHROME_LATEST_MACOS, cls.CHROME_LATEST_IOS, cls.CHROME_LATEST_ANDROID,
-            cls.CHROME_149, cls.CHROME_149_WINDOWS, cls.CHROME_149_LINUX, cls.CHROME_149_MACOS,
-            cls.CHROME_148, cls.CHROME_148_WINDOWS, cls.CHROME_148_LINUX, cls.CHROME_148_MACOS,
-            cls.CHROME_148_IOS, cls.CHROME_148_ANDROID,
-            cls.CHROME_147, cls.CHROME_147_WINDOWS, cls.CHROME_147_LINUX, cls.CHROME_147_MACOS,
-            cls.CHROME_147_IOS, cls.CHROME_147_ANDROID,
-            cls.CHROME_146, cls.CHROME_146_WINDOWS, cls.CHROME_146_LINUX, cls.CHROME_146_MACOS,
-            cls.CHROME_146_IOS, cls.CHROME_146_ANDROID,
-            cls.CHROME_145, cls.CHROME_145_WINDOWS, cls.CHROME_145_LINUX, cls.CHROME_145_MACOS,
-            cls.CHROME_145_IOS, cls.CHROME_145_ANDROID,
-            cls.CHROME_144, cls.CHROME_144_WINDOWS, cls.CHROME_144_LINUX, cls.CHROME_144_MACOS,
-            cls.CHROME_144_IOS, cls.CHROME_144_ANDROID,
-            cls.CHROME_143, cls.CHROME_143_WINDOWS, cls.CHROME_143_LINUX, cls.CHROME_143_MACOS,
-            cls.CHROME_143_IOS, cls.CHROME_143_ANDROID,
-            cls.CHROME_141, cls.CHROME_133,
-            cls.FIREFOX_LATEST, cls.FIREFOX_148, cls.FIREFOX_133,
-            cls.SAFARI_LATEST, cls.SAFARI_18, cls.SAFARI_17_IOS, cls.SAFARI_18_IOS,
-            cls.SAFARI_LATEST_IOS,
-        ]
+        names: List[str] = []
+        for attr, value in vars(cls).items():
+            if attr.isupper() and isinstance(value, str) and value not in names:
+                names.append(value)
+        return names
 
 
 # HTTP status reason phrases
@@ -1009,7 +1037,11 @@ ASYNC_CALLBACK = CFUNCTYPE(None, c_int64, c_char_p, c_char_p)
 
 # Session cache callback types
 # get: char* (*)(const char* key) - returns JSON string or NULL
-SESSION_CACHE_GET_CALLBACK = CFUNCTYPE(c_char_p, c_char_p)
+# The get callbacks return c_void_p, not c_char_p: a Python callback that
+# returns bytes through a c_char_p result makes ctypes keep a reference it can
+# never drop, so every cache hit would leak its value. They return the address
+# of a buffer the backend keeps alive instead (see SessionCacheBackend).
+SESSION_CACHE_GET_CALLBACK = CFUNCTYPE(c_void_p, c_char_p)
 # put: int (*)(const char* key, const char* value_json, int64_t ttl_seconds)
 SESSION_CACHE_PUT_CALLBACK = CFUNCTYPE(c_int, c_char_p, c_char_p, c_int64)
 # delete: int (*)(const char* key)
@@ -1017,7 +1049,7 @@ SESSION_CACHE_DELETE_CALLBACK = CFUNCTYPE(c_int, c_char_p)
 # error: void (*)(const char* operation, const char* key, const char* error)
 SESSION_CACHE_ERROR_CALLBACK = CFUNCTYPE(None, c_char_p, c_char_p, c_char_p)
 # ech_get: char* (*)(const char* key) - returns base64 string or NULL
-ECH_CACHE_GET_CALLBACK = CFUNCTYPE(c_char_p, c_char_p)
+ECH_CACHE_GET_CALLBACK = CFUNCTYPE(c_void_p, c_char_p)
 # ech_put: int (*)(const char* key, const char* value_base64, int64_t ttl_seconds)
 ECH_CACHE_PUT_CALLBACK = CFUNCTYPE(c_int, c_char_p, c_char_p, c_int64)
 
@@ -1750,7 +1782,7 @@ class Session:
     API is compatible with requests.Session.
 
     Args:
-        preset: Browser preset (default: "chrome-146")
+        preset: Browser preset (default: "chrome-latest")
         proxy: Proxy URL (e.g., "http://user:pass@host:port" or "socks5://host:port")
         tcp_proxy: Proxy URL for TCP protocols (HTTP/1.1, HTTP/2) - use with udp_proxy for split config
         udp_proxy: Proxy URL for UDP protocols (HTTP/3 via MASQUE) - use with tcp_proxy for split config
@@ -1809,7 +1841,7 @@ class Session:
 
     def __init__(
         self,
-        preset: str = "chrome-146",
+        preset: str = "chrome-latest",
         proxy: Optional[str] = None,
         tcp_proxy: Optional[str] = None,
         udp_proxy: Optional[str] = None,
@@ -3866,7 +3898,7 @@ class Session:
         )
 
         if stream_handle < 0:
-            raise HTTPCloakError("Failed to start streaming request")
+            raise HTTPCloakError(_last_error(self._lib, self._handle, "Failed to start streaming request"))
 
         # Get metadata
         metadata_ptr = self._lib.httpcloak_stream_get_metadata(stream_handle)
@@ -3991,7 +4023,7 @@ class Session:
         )
 
         if stream_handle < 0:
-            raise HTTPCloakError("Failed to start streaming request")
+            raise HTTPCloakError(_last_error(self._lib, self._handle, "Failed to start streaming request"))
 
         # Get metadata
         metadata_ptr = self._lib.httpcloak_stream_get_metadata(stream_handle)
@@ -4205,7 +4237,7 @@ class Session:
         )
 
         if stream_handle < 0:
-            raise HTTPCloakError("Failed to start streaming request")
+            raise HTTPCloakError(_last_error(self._lib, self._handle, "Failed to start streaming request"))
 
         # Get metadata
         metadata_ptr = self._lib.httpcloak_stream_get_metadata(stream_handle)
@@ -4463,7 +4495,7 @@ _default_config: Dict[str, Any] = {}
 
 
 def configure(
-    preset: str = "chrome-146",
+    preset: str = "chrome-latest",
     headers: Optional[Dict[str, str]] = None,
     auth: Optional[Tuple[str, str]] = None,
     proxy: Optional[str] = None,
@@ -4475,15 +4507,18 @@ def configure(
     retry: int = 0,
     retry_on_status: Optional[List[int]] = None,
     prefer_ipv4: bool = False,
+    **session_options: Any,
 ) -> None:
     """
     Configure defaults for module-level functions.
 
     This creates/recreates the default session with the specified settings.
     All subsequent calls to httpcloak.get(), httpcloak.post(), etc. will use these defaults.
+    Any other Session option (ja3, disable_http3, tls_only, local_address and
+    so on) can be passed as well and goes straight to the session.
 
     Args:
-        preset: Browser preset (default: "chrome-146")
+        preset: Browser preset (default: "chrome-latest")
         headers: Default headers for all requests
         auth: Default basic auth tuple (username, password)
         proxy: Proxy URL (e.g., "http://user:pass@host:port")
@@ -4495,6 +4530,7 @@ def configure(
         retry: Number of retries on failure (default: 0, no retries)
         retry_on_status: List of status codes to retry on (default: None — only consulted when retry > 0)
         prefer_ipv4: Prefer IPv4 addresses over IPv6 (default: False)
+        **session_options: Any other Session keyword argument
 
     Example:
         import httpcloak
@@ -4519,8 +4555,7 @@ def configure(
         # Apply auth to headers if provided
         final_headers = _apply_auth(headers, auth) or {}
 
-        # Store config
-        _default_config = {
+        config = {
             "preset": preset,
             "proxy": proxy,
             "timeout": timeout,
@@ -4530,25 +4565,25 @@ def configure(
             "max_redirects": max_redirects,
             "retry": retry,
             "retry_on_status": retry_on_status,
-            "headers": final_headers,
             "prefer_ipv4": prefer_ipv4,
+            **session_options,
         }
 
-        # Create new session with config
-        _default_session = Session(
-            preset=preset,
-            proxy=proxy,
-            timeout=timeout,
-            http_version=http_version,
-            verify=verify,
-            allow_redirects=allow_redirects,
-            max_redirects=max_redirects,
-            retry=retry,
-            retry_on_status=retry_on_status,
-            prefer_ipv4=prefer_ipv4,
-        )
+        # Create the session first, so an unknown option fails here and leaves
+        # the previous defaults in place.
+        session = Session(**config)
         if final_headers:
-            _default_session.headers.update(final_headers)
+            session.headers.update(final_headers)
+        _default_config = {**config, "headers": final_headers}
+        _default_session = session
+
+
+def _default_session_options(overrides: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """The configured Session options, with any per-call overrides on top."""
+    options = {k: v for k, v in _default_config.items() if k != "headers"}
+    if overrides:
+        options.update(overrides)
+    return options
 
 
 def load_preset(path: str) -> str:
@@ -4791,7 +4826,7 @@ class LocalProxy:
     def __init__(
         self,
         port: int = 0,
-        preset: str = "chrome-146",
+        preset: str = "chrome-latest",
         timeout: int = 30,
         max_connections: int = 1000,
         tcp_proxy: Optional[str] = None,
@@ -4803,7 +4838,7 @@ class LocalProxy:
 
         Args:
             port: Port to listen on (0 = auto-select available port)
-            preset: Browser fingerprint preset (default: "chrome-146")
+            preset: Browser fingerprint preset (default: "chrome-latest")
             timeout: Request timeout in seconds (default: 30)
             max_connections: Maximum concurrent connections (default: 1000)
             tcp_proxy: Default upstream TCP proxy URL (can be overridden per-request)
@@ -5084,25 +5119,25 @@ class SessionCacheBackend:
         self._c_put_ech = None
         self._c_error = None
 
-        # Persistent buffers for the get/get_ech callbacks. The Go side does
-        # NOT free the bytes we return and copies via C.GoString AFTER the
-        # callback frame unwinds, so a transient `result.encode()` would be
-        # freed by CPython before Go reads it (use-after-free).
+        # Persistent buffers for the get/get_ech callbacks. The callbacks hand
+        # back a raw address, and the native side copies the string only after
+        # the callback frame unwinds and does not free it, so a transient
+        # buffer would be freed by CPython before the copy (use-after-free).
         #
         # A single per-instance slot fixes the serial case but re-introduces
         # the UAF when ONE backend is shared across sessions/threads (a common
         # cache-pool pattern): a concurrent get on another thread overwrites
-        # the slot before Go copies the previous result. Instead we retain the
-        # last N encoded buffers in a bounded, lock-guarded ring. Each fresh
-        # buffer stays referenced until N more get calls happen — far more than
-        # the microsecond window between returning to Go and its C.GoString
-        # copy — so recent buffers survive concurrent shared-backend use
+        # the slot before the native side copies the previous result. Instead
+        # we retain the last N buffers in a bounded, lock-guarded ring. Each
+        # fresh buffer stays referenced until N more get calls happen, far
+        # more than the microsecond window between returning and the native
+        # copy, so recent buffers survive concurrent shared-backend use
         # without unbounded growth.
         from collections import deque
 
-        self._get_buf_lock = Lock()
+        self._get_buf_lock = threading.Lock()
         self._get_buf_ring = deque(maxlen=128)
-        self._ech_get_buf_lock = Lock()
+        self._ech_get_buf_lock = threading.Lock()
         self._ech_get_buf_ring = deque(maxlen=128)
 
     def _make_get_callback(self):
@@ -5118,14 +5153,14 @@ class SessionCacheBackend:
                 result = get_fn(key)
                 if result is None:
                     return None
-                # Retain the encoded bytes in the bounded ring so the buffer
-                # outlives this callback frame — Go copies it via C.GoString
-                # after we return and does not free it. The lock-guarded ring
-                # keeps recent buffers referenced under concurrent shared use.
-                buf = result.encode("utf-8")
+                # Retain the buffer in the bounded ring so it outlives this
+                # callback frame: the native side copies it after we return
+                # and does not free it. The lock-guarded ring keeps recent
+                # buffers referenced under concurrent shared use.
+                buf = create_string_buffer(result.encode("utf-8"))
                 with owner._get_buf_lock:
                     owner._get_buf_ring.append(buf)
-                return buf
+                return addressof(buf)
             except Exception:
                 return None
 
@@ -5175,14 +5210,14 @@ class SessionCacheBackend:
                 result = get_fn(key)
                 if result is None:
                     return None
-                # Retain the encoded bytes in the bounded ring so the buffer
-                # outlives this callback frame — Go copies it via C.GoString
-                # after we return and does not free it. The lock-guarded ring
-                # keeps recent buffers referenced under concurrent shared use.
-                buf = result.encode("utf-8")
+                # Retain the buffer in the bounded ring so it outlives this
+                # callback frame: the native side copies it after we return
+                # and does not free it. The lock-guarded ring keeps recent
+                # buffers referenced under concurrent shared use.
+                buf = create_string_buffer(result.encode("utf-8"))
                 with owner._ech_get_buf_lock:
                     owner._ech_get_buf_ring.append(buf)
-                return buf
+                return addressof(buf)
             except Exception:
                 return None
 
@@ -5391,32 +5426,11 @@ def _get_default_session() -> Session:
     if _default_session is None:
         with _default_session_lock:
             if _default_session is None:
-                preset = _default_config.get("preset", "chrome-146")
-                proxy = _default_config.get("proxy")
-                timeout = _default_config.get("timeout", 30)
-                http_version = _default_config.get("http_version", "auto")
-                verify = _default_config.get("verify", True)
-                allow_redirects = _default_config.get("allow_redirects", True)
-                max_redirects = _default_config.get("max_redirects", 10)
-                retry = _default_config.get("retry", 0)
-                retry_on_status = _default_config.get("retry_on_status")
+                session = Session(**_default_session_options())
                 headers = _default_config.get("headers", {})
-                prefer_ipv4 = _default_config.get("prefer_ipv4", False)
-
-                _default_session = Session(
-                    preset=preset,
-                    proxy=proxy,
-                    timeout=timeout,
-                    http_version=http_version,
-                    verify=verify,
-                    allow_redirects=allow_redirects,
-                    max_redirects=max_redirects,
-                    retry=retry,
-                    retry_on_status=retry_on_status,
-                    prefer_ipv4=prefer_ipv4,
-                )
                 if headers:
-                    _default_session.headers.update(headers)
+                    session.headers.update(headers)
+                _default_session = session
     return _default_session
 
 
@@ -5453,39 +5467,16 @@ def _get_session_for_request(kwargs: dict) -> Tuple[Session, bool]:
     if not has_override:
         return _get_default_session(), False
 
-    # Get current defaults and apply overrides
-    final_preset = preset if preset is not None else _default_config.get("preset", "chrome-146")
-    final_proxy = proxy if proxy is not None else _default_config.get("proxy")
-    final_tcp_proxy = tcp_proxy if tcp_proxy is not None else _default_config.get("tcp_proxy")
-    final_udp_proxy = udp_proxy if udp_proxy is not None else _default_config.get("udp_proxy")
-    final_timeout = _default_config.get("timeout", 30)
-    final_http_version = http_version if http_version is not None else _default_config.get("http_version", "auto")
-    final_verify = verify if verify is not None else _default_config.get("verify", True)
-    final_allow_redirects = allow_redirects if allow_redirects is not None else _default_config.get("allow_redirects", True)
-    final_max_redirects = max_redirects if max_redirects is not None else _default_config.get("max_redirects", 10)
-    final_retry = retry if retry is not None else _default_config.get("retry", 0)
-    final_retry_on_status = retry_on_status if retry_on_status is not None else _default_config.get("retry_on_status")
-    final_prefer_ipv4 = prefer_ipv4 if prefer_ipv4 is not None else _default_config.get("prefer_ipv4", False)
-    final_connect_to = connect_to if connect_to is not None else _default_config.get("connect_to")
-    final_ech_config_domain = ech_config_domain if ech_config_domain is not None else _default_config.get("ech_config_domain")
-
-    # Create temporary session with overrides
-    temp_session = Session(
-        preset=final_preset,
-        proxy=final_proxy,
-        tcp_proxy=final_tcp_proxy,
-        udp_proxy=final_udp_proxy,
-        timeout=final_timeout,
-        http_version=final_http_version,
-        verify=final_verify,
-        allow_redirects=final_allow_redirects,
-        max_redirects=final_max_redirects,
-        retry=final_retry,
-        retry_on_status=final_retry_on_status,
-        prefer_ipv4=final_prefer_ipv4,
-        connect_to=final_connect_to,
-        ech_config_domain=final_ech_config_domain,
-    )
+    # Start from the configured defaults, every option configure() was given,
+    # and apply the overrides on top
+    overrides = {
+        "preset": preset, "proxy": proxy, "tcp_proxy": tcp_proxy, "udp_proxy": udp_proxy,
+        "verify": verify, "allow_redirects": allow_redirects, "http_version": http_version,
+        "max_redirects": max_redirects, "retry": retry, "retry_on_status": retry_on_status,
+        "prefer_ipv4": prefer_ipv4, "connect_to": connect_to, "ech_config_domain": ech_config_domain,
+    }
+    temp_session = Session(**_default_session_options(
+        {k: v for k, v in overrides.items() if v is not None}))
 
     # Copy default headers
     default_headers = _default_config.get("headers", {})

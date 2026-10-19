@@ -127,13 +127,15 @@ Console.WriteLine(resp.StatusCode);
 
 ### Presets
 
-- **Chrome**: 133, 141, 143 through 152, with per-OS variants
-  (Windows / Linux / macOS / Android / iOS) where they differ.
+- **Chrome**: 133, 141, 143 through 155, with per-OS variants
+  (Windows / Linux / macOS / Android / iOS) where they differ. iOS
+  goes up to 152.
 - **Firefox**: 133, 148.
 - **Safari**: 18 (desktop), 17 / 18 (iOS).
 - **`chrome-latest` aliases**: `chrome-latest`, `chrome-latest-windows`,
   `chrome-latest-linux`, `chrome-latest-macos`, `chrome-latest-android`,
-  `chrome-latest-ios`. Auto-track the newest shipped Chrome major.
+  `chrome-latest-ios`. Auto-track the newest shipped Chrome major
+  (155).
 
 ### Bindings
 
@@ -141,6 +143,7 @@ Console.WriteLine(resp.StatusCode);
 - **Python**: `pip install httpcloak`
 - **Node.js**: `npm install httpcloak`
 - **.NET**: `dotnet add package HttpCloak`
+- **Android (Kotlin)**: build from source, see [Android](/bindings/android)
 
 ## Where to next
 

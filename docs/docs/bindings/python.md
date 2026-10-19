@@ -67,7 +67,7 @@ The main class. Constructor signature (kwargs, all optional):
 
 ```python
 httpcloak.Session(
-    preset: str = "chrome-152",
+    preset: str = "chrome-latest",
     proxy: Optional[str] = None,
     tcp_proxy: Optional[str] = None,
     udp_proxy: Optional[str] = None,
@@ -358,7 +358,8 @@ httpcloak.load_preset(path)          # register a JSON preset file
 httpcloak.load_preset_from_json(...) # register a JSON preset string
 httpcloak.unregister_preset(name)
 httpcloak.describe_preset(name)
-httpcloak.available_presets()
+httpcloak.available_presets()        # live list, custom presets included
+httpcloak.Preset.all()               # every name this binding version has a constant for
 httpcloak.version()
 httpcloak.set_ech_dns_servers([...])
 httpcloak.get_ech_dns_servers()

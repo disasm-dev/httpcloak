@@ -53,6 +53,12 @@ internal_tests/
 !/redirect_test.go
 !/extra_fp_test.go
 !/close_graceful_test.go
+!/trust_anchors_wire_test.go
+!/deflate_wire_test.go
+!/zstd_stream_close_test.go
+!/disable_h3_test.go
+!/h2_trailing_endstream_test.go
+!/gzip_session_test.go
 
 # Python regression locks. The repo tracked no Python tests until the fast-path
 # JSON body bug (post_fast/put_fast crashed outright on json= with no headers)
@@ -60,6 +66,11 @@ internal_tests/
 # file at a time, like the root-level Go tests above, so this stays a
 # deliberate list rather than an open door.
 !/tests/python/test_json_alias.py
+!/tests/python/test_session_cache_backend.py
+!/tests/python/test_configure.py
+# Node regression locks, on the same terms.
+!/tests/nodejs/test_session_cache_concurrency.js
+!/tests/nodejs/test_configure.js
 
 # Local workspace config (points at machine-local fork paths)
 go.work

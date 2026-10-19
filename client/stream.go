@@ -3,17 +3,19 @@ package client
 import (
 	"bufio"
 	"bytes"
-	"compress/gzip"
 	"context"
 	"fmt"
-	"io"
 	http "github.com/sardanioss/http"
+	"io"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/andybalholm/brotli"
 	"github.com/klauspost/compress/zstd"
+	"github.com/sardanioss/httpcloak/internal/compress"
+	"github.com/sardanioss/httpcloak/internal/gunzip"
 	"github.com/sardanioss/httpcloak/protocol"
 )
 
@@ -48,10 +50,13 @@ func (r *StreamResponse) Close() error {
 	if r.cancel != nil {
 		r.cancel()
 	}
+	// The body before the decompressor: a zstd decoder's Close waits for a
+	// Read in progress, and closing the body is what ends that Read.
+	err := r.rawReader.Close()
 	if r.decompressor != nil {
 		r.decompressor.Close()
 	}
-	return r.rawReader.Close()
+	return err
 }
 
 // ReadAll reads the entire response body into memory
@@ -295,11 +300,13 @@ func (c *Client) DoStream(ctx context.Context, req *Request) (*StreamResponse, e
 func setupDecompressor(body io.ReadCloser, encoding string) (io.ReadCloser, io.Closer) {
 	switch strings.ToLower(encoding) {
 	case "gzip":
-		reader, err := gzip.NewReader(body)
+		// The header is read here, before the stream is handed out, so a body
+		// whose header cannot be read still falls back to the raw bytes.
+		stream, err := gunzip.NewStream(body)
 		if err != nil {
 			return body, nil
 		}
-		return reader, reader
+		return stream, nil
 	case "br":
 		return &brotliReadCloser{brotli.NewReader(body)}, nil
 	case "zstd":
@@ -307,7 +314,16 @@ func setupDecompressor(body io.ReadCloser, encoding string) (io.ReadCloser, io.C
 		if err != nil {
 			return body, nil
 		}
-		return &zstdReadCloser{decoder}, nil
+		// Returned as the closer as well, so StreamResponse.Close releases the
+		// decoder's goroutines when a stream is closed early (#118). Its Close
+		// closes the decoder only; the body is closed separately.
+		reader := &zstdReadCloser{decoder: decoder}
+		return reader, reader
+	case "deflate":
+		// This case was missing, so a streamed deflate response came back
+		// still compressed even though Accept-Encoding offers deflate.
+		reader := compress.NewDeflateReader(body)
+		return reader, reader
 	default:
 		return body, nil
 	}
@@ -326,13 +342,24 @@ func (b *brotliReadCloser) Close() error {
 	return nil // brotli.Reader doesn't need closing
 }
 
-// zstdReadCloser wraps zstd.Decoder to implement io.ReadCloser
+// zstdReadCloser wraps zstd.Decoder to implement io.ReadCloser. Read and
+// Close share a lock because Decoder.Close must not run while a Read is in
+// the decoder, which a stream closed from another goroutine (Lines) does.
 type zstdReadCloser struct {
-	*zstd.Decoder
+	mu      sync.Mutex
+	decoder *zstd.Decoder
+}
+
+func (z *zstdReadCloser) Read(p []byte) (int, error) {
+	z.mu.Lock()
+	defer z.mu.Unlock()
+	return z.decoder.Read(p)
 }
 
 func (z *zstdReadCloser) Close() error {
-	z.Decoder.Close()
+	z.mu.Lock()
+	defer z.mu.Unlock()
+	z.decoder.Close()
 	return nil
 }
 

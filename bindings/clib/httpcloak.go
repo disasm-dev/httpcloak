@@ -6,255 +6,7 @@ package main
 
 #include <stdlib.h>
 #include <stdint.h>
-
-typedef void (*async_callback)(int64_t callback_id, const char* response_json, const char* error);
-
-// One per process, set with httpcloak_set_raw_callback. Every httpcloak_request_raw_async completes
-// here: meta_json describes the response without its body and body holds the body's bytes, or
-// meta_json is NULL and error says what failed. All three buffers are freed once it returns.
-typedef void (*raw_callback)(int64_t request_id, const char* meta_json, const void* body, int32_t body_len, const char* error);
-
-// Session cache callbacks - called by Go to get/put TLS sessions from external cache
-// SYNC mode: returns result immediately
-// get: returns JSON string with session data, or NULL if not found
-// put: stores session data, returns 0 on success, non-zero on error
-// delete: removes session, returns 0 on success
-typedef char* (*session_cache_get_callback)(const char* key);
-typedef int (*session_cache_put_callback)(const char* key, const char* value_json, int64_t ttl_seconds);
-typedef int (*session_cache_delete_callback)(const char* key);
-typedef void (*session_cache_error_callback)(const char* operation, const char* key, const char* error);
-
-// ECH config cache callbacks - for HTTP/3 ECH support
-typedef char* (*ech_cache_get_callback)(const char* key);
-typedef int (*ech_cache_put_callback)(const char* key, const char* value_base64, int64_t ttl_seconds);
-
-// ASYNC mode: callbacks notify JS, JS calls back with result via httpcloak_async_cache_*_result
-typedef void (*async_cache_get_callback)(int64_t request_id, const char* key);
-typedef void (*async_cache_put_callback)(int64_t request_id, const char* key, const char* value_json, int64_t ttl_seconds);
-typedef void (*async_cache_delete_callback)(int64_t request_id, const char* key);
-typedef void (*async_ech_get_callback)(int64_t request_id, const char* key);
-typedef void (*async_ech_put_callback)(int64_t request_id, const char* key, const char* value_base64, int64_t ttl_seconds);
-
-// Helper function to invoke callback from Go
-static void invoke_callback(async_callback cb, int64_t callback_id, const char* response_json, const char* error) {
-    if (cb != NULL) {
-        cb(callback_id, response_json, error);
-    }
-}
-
-// Async completions are delivered from a thread this file owns rather than from the
-// goroutine that ran the request. A host runtime adopts whatever thread its code runs on,
-// and a Go thread cannot take the special user APC such a runtime may later send it:
-// on a goroutine stack NtContinueEx refuses the resume with 0xC000000D (see hop_windows.c),
-// which is non-continuable, so the process dies with no exception and no dump.
-typedef struct cb_item {
-    async_callback cb;
-    raw_callback rcb;
-    int64_t id;
-    char* resp;      // async_callback: the response json; raw_callback: the meta json
-    void* body;
-    int32_t body_len;
-    char* err;
-    struct cb_item* next;
-} cb_item;
-
-static cb_item* cb_head = NULL;
-static cb_item* cb_tail = NULL;
-
-#ifdef _WIN32
-#include <windows.h>
-static CRITICAL_SECTION cb_lock;
-static CONDITION_VARIABLE cb_ready;
-#define CB_LOCK()   EnterCriticalSection(&cb_lock)
-#define CB_UNLOCK() LeaveCriticalSection(&cb_lock)
-#define CB_WAIT()   SleepConditionVariableCS(&cb_ready, &cb_lock, INFINITE)
-#define CB_WAKE()   WakeConditionVariable(&cb_ready)
-#else
-#include <pthread.h>
-static pthread_mutex_t cb_lock = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t cb_ready = PTHREAD_COND_INITIALIZER;
-#define CB_LOCK()   pthread_mutex_lock(&cb_lock)
-#define CB_UNLOCK() pthread_mutex_unlock(&cb_lock)
-#define CB_WAIT()   pthread_cond_wait(&cb_ready, &cb_lock)
-#define CB_WAKE()   pthread_cond_signal(&cb_ready)
-#endif
-
-static void cb_deliver(void) {
-    for (;;) {
-        cb_item* it;
-        CB_LOCK();
-        while (cb_head == NULL) {
-            CB_WAIT();
-        }
-        it = cb_head;
-        cb_head = it->next;
-        if (cb_head == NULL) {
-            cb_tail = NULL;
-        }
-        CB_UNLOCK();
-
-        if (it->rcb != NULL) {
-            it->rcb(it->id, it->resp, it->body, it->body_len, it->err);
-        } else if (it->cb != NULL) {
-            it->cb(it->id, it->resp, it->err);
-        }
-        free(it->resp);
-        free(it->body);
-        free(it->err);
-        free(it);
-    }
-}
-
-#ifdef _WIN32
-static DWORD WINAPI cb_thread(LPVOID unused) {
-    (void)unused;
-    cb_deliver();
-    return 0;
-}
-
-static void cb_start(void) {
-    HANDLE t;
-    InitializeCriticalSection(&cb_lock);
-    InitializeConditionVariable(&cb_ready);
-    t = CreateThread(NULL, 0, cb_thread, NULL, 0, NULL);
-    if (t != NULL) {
-        CloseHandle(t);
-    }
-}
-#else
-static void* cb_thread(void* unused) {
-    (void)unused;
-    cb_deliver();
-    return NULL;
-}
-
-static void cb_start(void) {
-    pthread_t t;
-    if (pthread_create(&t, NULL, cb_thread, NULL) == 0) {
-        pthread_detach(t);
-    }
-}
-#endif
-
-static void cb_push(cb_item* it) {
-    CB_LOCK();
-    if (cb_tail == NULL) {
-        cb_head = it;
-    } else {
-        cb_tail->next = it;
-    }
-    cb_tail = it;
-    CB_WAKE();
-    CB_UNLOCK();
-}
-
-// Takes ownership of response_json and error; the delivering thread frees them.
-static void enqueue_callback(async_callback cb, int64_t callback_id, char* response_json, char* error) {
-    cb_item* it = (cb_item*)calloc(1, sizeof(cb_item));
-    if (it == NULL) {
-        free(response_json);
-        free(error);
-        return;
-    }
-
-    it->cb = cb;
-    it->id = callback_id;
-    it->resp = response_json;
-    it->err = error;
-    cb_push(it);
-}
-
-// Takes ownership of meta_json, body and error; the delivering thread frees them.
-static void enqueue_raw_callback(raw_callback cb, int64_t request_id, char* meta_json, void* body, int32_t body_len, char* error) {
-    cb_item* it = (cb_item*)calloc(1, sizeof(cb_item));
-    if (it == NULL) {
-        free(meta_json);
-        free(body);
-        free(error);
-        return;
-    }
-
-    it->rcb = cb;
-    it->id = request_id;
-    it->resp = meta_json;
-    it->body = body;
-    it->body_len = body_len;
-    it->err = error;
-    cb_push(it);
-}
-
-// Helper functions to invoke SYNC session cache callbacks
-static char* invoke_cache_get(session_cache_get_callback cb, const char* key) {
-    if (cb != NULL) {
-        return cb(key);
-    }
-    return NULL;
-}
-
-static int invoke_cache_put(session_cache_put_callback cb, const char* key, const char* value_json, int64_t ttl_seconds) {
-    if (cb != NULL) {
-        return cb(key, value_json, ttl_seconds);
-    }
-    return -1;
-}
-
-static void invoke_cache_error(session_cache_error_callback cb, const char* operation, const char* key, const char* error) {
-    if (cb != NULL) {
-        cb(operation, key, error);
-    }
-}
-
-static int invoke_cache_delete(session_cache_delete_callback cb, const char* key) {
-    if (cb != NULL) {
-        return cb(key);
-    }
-    return -1;
-}
-
-static char* invoke_ech_get(ech_cache_get_callback cb, const char* key) {
-    if (cb != NULL) {
-        return cb(key);
-    }
-    return NULL;
-}
-
-static int invoke_ech_put(ech_cache_put_callback cb, const char* key, const char* value_base64, int64_t ttl_seconds) {
-    if (cb != NULL) {
-        return cb(key, value_base64, ttl_seconds);
-    }
-    return -1;
-}
-
-// Helper functions to invoke ASYNC session cache callbacks
-static void invoke_async_cache_get(async_cache_get_callback cb, int64_t request_id, const char* key) {
-    if (cb != NULL) {
-        cb(request_id, key);
-    }
-}
-
-static void invoke_async_cache_put(async_cache_put_callback cb, int64_t request_id, const char* key, const char* value_json, int64_t ttl_seconds) {
-    if (cb != NULL) {
-        cb(request_id, key, value_json, ttl_seconds);
-    }
-}
-
-static void invoke_async_cache_delete(async_cache_delete_callback cb, int64_t request_id, const char* key) {
-    if (cb != NULL) {
-        cb(request_id, key);
-    }
-}
-
-static void invoke_async_ech_get(async_ech_get_callback cb, int64_t request_id, const char* key) {
-    if (cb != NULL) {
-        cb(request_id, key);
-    }
-}
-
-static void invoke_async_ech_put(async_ech_put_callback cb, int64_t request_id, const char* key, const char* value_base64, int64_t ttl_seconds) {
-    if (cb != NULL) {
-        cb(request_id, key, value_base64, ttl_seconds);
-    }
-}
+#include "callback_pool.h"
 */
 import "C"
 import (
@@ -1147,7 +899,7 @@ func httpcloak_get_raw(handle C.int64_t, url *C.char, optionsJSON *C.char) (hcRe
 	if options.Timeout > 0 {
 		ctx, cancel = context.WithTimeout(ctx, time.Duration(options.Timeout)*time.Millisecond)
 	} else {
-		ctx, cancel = context.WithTimeout(ctx, 30*time.Second)
+		ctx, cancel = context.WithTimeout(ctx, sessionDefaultTimeout(session))
 	}
 	defer cancel()
 
@@ -1223,7 +975,7 @@ func httpcloak_post_raw(handle C.int64_t, url *C.char, body *C.char, bodyLen C.i
 	if options.Timeout > 0 {
 		ctx, cancel = context.WithTimeout(ctx, time.Duration(options.Timeout)*time.Millisecond)
 	} else {
-		ctx, cancel = context.WithTimeout(ctx, 30*time.Second)
+		ctx, cancel = context.WithTimeout(ctx, sessionDefaultTimeout(session))
 	}
 	defer cancel()
 
@@ -1295,7 +1047,7 @@ func httpcloak_request_raw(handle C.int64_t, requestJSON *C.char, body *C.char, 
 	if config.Timeout > 0 {
 		ctx, cancel = context.WithTimeout(ctx, time.Duration(config.Timeout)*time.Millisecond)
 	} else {
-		ctx, cancel = context.WithTimeout(ctx, 30*time.Second)
+		ctx, cancel = context.WithTimeout(ctx, sessionDefaultTimeout(session))
 	}
 	defer cancel()
 
@@ -1340,7 +1092,7 @@ func httpcloak_request_raw(handle C.int64_t, requestJSON *C.char, body *C.char, 
 func httpcloak_session_new(configJSON *C.char) (hcRet C.int64_t) {
 	defer guardInt64("httpcloak_session_new", &hcRet)
 	config := SessionConfig{
-		Preset:      "chrome-146",
+		Preset:      "chrome-latest",
 		Timeout:     30,
 		HTTPVersion: "auto",
 	}
@@ -1692,6 +1444,17 @@ func getSession(handle C.int64_t) *httpcloak.Session {
 	return sessions[int64(handle)]
 }
 
+// sessionDefaultTimeout bounds a synchronous request that carries no timeout
+// of its own. It is the session's configured timeout, so a session created or
+// restored with a longer one is not cut short at 30s, and 30s only for a
+// session that has none.
+func sessionDefaultTimeout(session *httpcloak.Session) time.Duration {
+	if t := session.GetTransport(); t != nil && t.Timeout() > 0 {
+		return t.Timeout()
+	}
+	return 30 * time.Second
+}
+
 //export httpcloak_session_fork
 func httpcloak_session_fork(handle C.int64_t) (hcRet C.int64_t) {
 	defer guardInt64("httpcloak_session_fork", &hcRet)
@@ -1785,7 +1548,7 @@ func httpcloak_get(handle C.int64_t, url *C.char, optionsJSON *C.char) (hcRet *C
 		ctx, cancel = context.WithTimeout(ctx, time.Duration(options.Timeout)*time.Millisecond)
 	} else {
 		// Default 30s timeout to prevent indefinite hangs (especially for MASQUE)
-		ctx, cancel = context.WithTimeout(ctx, 30*time.Second)
+		ctx, cancel = context.WithTimeout(ctx, sessionDefaultTimeout(session))
 	}
 	defer cancel()
 
@@ -1838,7 +1601,7 @@ func httpcloak_post(handle C.int64_t, url *C.char, body *C.char, optionsJSON *C.
 		ctx, cancel = context.WithTimeout(ctx, time.Duration(options.Timeout)*time.Millisecond)
 	} else {
 		// Default 30s timeout to prevent indefinite hangs (especially for MASQUE)
-		ctx, cancel = context.WithTimeout(ctx, 30*time.Second)
+		ctx, cancel = context.WithTimeout(ctx, sessionDefaultTimeout(session))
 	}
 	defer cancel()
 
@@ -1902,7 +1665,7 @@ func httpcloak_request(handle C.int64_t, requestJSON *C.char) (hcRet *C.char) {
 		ctx, cancel = context.WithTimeout(ctx, time.Duration(config.Timeout)*time.Second)
 	} else {
 		// Default 30s timeout to prevent indefinite hangs (especially for MASQUE)
-		ctx, cancel = context.WithTimeout(ctx, 30*time.Second)
+		ctx, cancel = context.WithTimeout(ctx, sessionDefaultTimeout(session))
 	}
 	defer cancel()
 
@@ -1972,7 +1735,9 @@ func httpcloak_cancel_request(callbackID C.int64_t) {
 	}
 }
 
-func invokeCallback(callbackID int64, responseJSON string, errStr string) {
+// invokeCallback reports whether the result reached a registered callback. It
+// does not when the caller unregistered the ID first, typically on cancel.
+func invokeCallback(callbackID int64, responseJSON string, errStr string) bool {
 	callbackMu.Lock()
 	callback, exists := asyncCallbacks[callbackID]
 	// Auto-cleanup: remove callback and cancel func after retrieval to prevent memory leaks
@@ -1983,7 +1748,7 @@ func invokeCallback(callbackID int64, responseJSON string, errStr string) {
 	callbackMu.Unlock()
 
 	if !exists {
-		return
+		return false
 	}
 
 	var respC *C.char
@@ -1996,13 +1761,16 @@ func invokeCallback(callbackID int64, responseJSON string, errStr string) {
 		errC = C.CString(errStr)
 	}
 
-	// Delivered from the C-owned thread, not this goroutine's: the host's callback must not
-	// run on a thread the Go runtime owns. The strings go with it and it frees them.
-	callbackThread.Do(func() { C.cb_start() })
-	C.enqueue_callback(callback, C.int64_t(callbackID), respC, errC)
-}
+	C.invoke_callback(callback, C.int64_t(callbackID), respC, errC)
 
-var callbackThread sync.Once
+	if respC != nil {
+		C.free(unsafe.Pointer(respC))
+	}
+	if errC != nil {
+		C.free(unsafe.Pointer(errC))
+	}
+	return true
+}
 
 // ============================================================================
 // Raw asynchronous requests
@@ -2037,7 +1805,7 @@ func httpcloak_cancel_raw_request(requestID C.int64_t) {
 }
 
 // deliverRaw hands one completion to the process callback: meta and body on success, errJSON
-// on failure. The C copies belong to the delivery thread, which frees them after the call.
+// on failure. The C copies are freed once the callback returns.
 func deliverRaw(requestID int64, meta []byte, body []byte, errJSON string) {
 	rawMu.Lock()
 	callback := rawCallback
@@ -2059,8 +1827,11 @@ func deliverRaw(requestID int64, meta []byte, body []byte, errJSON string) {
 		}
 	}
 
-	callbackThread.Do(func() { C.cb_start() })
-	C.enqueue_raw_callback(callback, C.int64_t(requestID), metaC, bodyC, C.int32_t(len(body)), errC)
+	C.invoke_raw_callback(callback, C.int64_t(requestID), metaC, bodyC, C.int32_t(len(body)), errC)
+
+	C.free(unsafe.Pointer(metaC))
+	C.free(bodyC)
+	C.free(unsafe.Pointer(errC))
 }
 
 func rawErrorJSON(err error) string {
@@ -3049,9 +2820,9 @@ func httpcloak_free_string(str *C.char) {
 
 // libVersion is the one place the C ABI reports a version from. It has to be
 // bumped with the nine binding version files and the five optionalDependencies
-// pins; it was missed for 1.7.1-beta.2, so every binding reported 1.6.11 off a
-// 1.7.1b2 wheel.
-const libVersion = "1.7.1"
+// pins; it was missed for 1.7.2-beta.2, so every binding reported 1.6.11 off a
+// 1.7.2b2 wheel.
+const libVersion = "1.7.3"
 
 // httpcloak_trim_memory returns freed memory to the operating system and blocks
 // until it has.
@@ -3175,10 +2946,9 @@ func (c *CSessionCacheBackend) Get(ctx context.Context, key string) (*transport.
 	if resultC == nil {
 		return nil, nil // Not found
 	}
-	// Note: Don't free resultC - it's managed by the callback caller (Python/Node)
-	// We only copy the string data with C.GoString
-
+	// resultC is invoke_cache_get's own copy; the callback's buffer is untouched.
 	resultJSON := C.GoString(resultC)
+	C.free(unsafe.Pointer(resultC))
 	if resultJSON == "" {
 		return nil, nil
 	}
@@ -3247,9 +3017,9 @@ func (c *CSessionCacheBackend) GetECHConfig(ctx context.Context, key string) ([]
 	if resultC == nil {
 		return nil, nil // Not found
 	}
-	// Note: Don't free resultC - it's managed by the callback caller (Python/Node)
-
+	// resultC is invoke_ech_get's own copy; the callback's buffer is untouched.
 	resultBase64 := C.GoString(resultC)
+	C.free(unsafe.Pointer(resultC))
 	if resultBase64 == "" {
 		return nil, nil
 	}
@@ -3760,7 +3530,7 @@ func httpcloak_local_proxy_start(configJSON *C.char) (hcRet C.int64_t) {
 	defer guardInt64("httpcloak_local_proxy_start", &hcRet)
 	config := LocalProxyConfig{
 		Port:           0,
-		Preset:         "chrome-146",
+		Preset:         "chrome-latest",
 		Timeout:        30,
 		MaxConnections: 1000,
 	}
@@ -4058,6 +3828,7 @@ func httpcloak_stream_get(sessionHandle C.int64_t, url *C.char, optionsJSON *C.c
 	resp, err := session.DoStream(ctx, req)
 	if err != nil {
 		cancel()
+		setLastError(sessionHandle, "%v", err)
 		return -1
 	}
 
@@ -4124,6 +3895,7 @@ func httpcloak_stream_post(sessionHandle C.int64_t, url *C.char, body *C.char, o
 	resp, err := session.DoStream(ctx, req)
 	if err != nil {
 		cancel()
+		setLastError(sessionHandle, "%v", err)
 		return -1
 	}
 
@@ -4150,6 +3922,7 @@ func httpcloak_stream_request(sessionHandle C.int64_t, requestJSON *C.char) (hcR
 	if requestJSON != nil {
 		jsonStr := C.GoString(requestJSON)
 		if err := json.Unmarshal([]byte(jsonStr), &config); err != nil {
+			setLastError(sessionHandle, "request JSON is not valid: %v", err)
 			return -1
 		}
 	}
@@ -4172,6 +3945,8 @@ func httpcloak_stream_request(sessionHandle C.int64_t, requestJSON *C.char) (hcR
 		bodyBytes, err := decodeRequestBody(config.Body, config.BodyEncoding)
 		if err != nil {
 			cancel()
+			setLastError(sessionHandle, "request body could not be decoded as %s: %v",
+				config.BodyEncoding, err)
 			return -1
 		}
 		bodyReader = bytes.NewReader(bodyBytes)
@@ -4194,6 +3969,7 @@ func httpcloak_stream_request(sessionHandle C.int64_t, requestJSON *C.char) (hcR
 	resp, err := session.DoStream(ctx, req)
 	if err != nil {
 		cancel()
+		setLastError(sessionHandle, "%v", err)
 		return -1
 	}
 
@@ -4332,10 +4108,15 @@ func httpcloak_stream_request_async(sessionHandle C.int64_t, requestJSON *C.char
 		meta.StreamHandle = handle
 		metaJSON, err := json.Marshal(meta)
 		if err != nil {
+			httpcloak_stream_close(C.int64_t(handle))
 			fail("encode stream metadata: " + err.Error())
 			return
 		}
-		invokeCallback(int64(callbackID), string(metaJSON), "")
+		// A caller that cancelled by unregistering the callback never learns
+		// this handle, so nothing else would ever close the stream.
+		if !invokeCallback(int64(callbackID), string(metaJSON), "") {
+			httpcloak_stream_close(C.int64_t(handle))
+		}
 	}()
 }
 
@@ -4429,15 +4210,20 @@ func httpcloak_stream_read_raw(streamHandle C.int64_t, buffer unsafe.Pointer, bu
 	// Create a Go slice backed by the C buffer
 	buf := (*[1 << 30]byte)(buffer)[:size:size]
 
+	// A reader may return the last bytes together with io.EOF. Hand those
+	// bytes over first; the next call reports the EOF (or error) on its own.
 	n, err := stream.Read(buf)
+	if n > 0 {
+		return C.int(n)
+	}
 	if err != nil {
-		if err.Error() == "EOF" {
+		if errors.Is(err, io.EOF) {
 			return 0 // EOF
 		}
 		return -1 // Error
 	}
 
-	return C.int(n)
+	return 0
 }
 
 //export httpcloak_stream_close

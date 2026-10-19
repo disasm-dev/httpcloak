@@ -76,7 +76,7 @@ new Session(options?: SessionOptions);
 
 ```ts
 {
-  preset?: string;             // "chrome-152" by default
+  preset?: string;             // "chrome-latest" by default
   proxy?: string;
   tcpProxy?: string;
   udpProxy?: string;
@@ -140,6 +140,8 @@ session.requestSync(method, url, options?): Response;
 ```
 
 These block the event loop. Don't use them inside an async server. They exist for scripts and CLIs where the event loop isn't a concern.
+
+One case where it is: a session cache set up with `configureSessionCache`. Its callbacks are JavaScript, so they need the JS thread, and a sync call that does a new TLS handshake would wait on a callback that can't run until that same call returns. So on a session created while a cache is configured, the sync, stream and fast-path methods, `uploadStream` and `warmup` throw an `HTTPCloakError` straight away instead of hanging. Use the async methods on those sessions. A session keeps the cache it was created with, so `clearSessionCache()` only frees up sessions created after it, and forks of a session follow their parent.
 
 ### `RequestOptions`
 
@@ -405,6 +407,7 @@ What each piece does:
 - `loadPreset(filePath)` / `loadPresetFromJSON(jsonString)` register a custom preset at runtime; both return the name to pass to a `Session` constructor. `unregisterPreset(name)` removes one.
 - `setEchDnsServers(["8.8.8.8:53", ...])` overrides the DNS resolvers used for ECH HTTPS RR lookups (default: Google, Cloudflare, Quad9). Pass `null` to reset. `getEchDnsServers()` returns the current list.
 - `availablePresets()` returns `{ [name]: { protocols: ["h1","h2","h3"] } }` so you can filter by supported protocol.
+- `Preset.all()` lists every preset name this binding version has a constant for, each once. `availablePresets()` is the live list, custom presets included.
 - `version()` returns the linked native library version.
 
 Module-level `get/post/...` use a process-wide implicit session configured via `configure({...})`. They're handy for one-off scripts; use `Session` directly for anything long-lived.

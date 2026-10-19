@@ -58,7 +58,7 @@ sed -i "s/^version = \".*\"/version = \"$NEW_VERSION\"/" pyproject.toml
 # Update clib httpcloak.go version string
 echo "  -> clib/httpcloak.go"
 cd "$SCRIPT_DIR/clib"
-sed -i "s/return C.CString(\"[0-9]*\.[0-9]*\.[0-9]*\")/return C.CString(\"$NEW_VERSION\")/" httpcloak.go
+sed -i "s/^const libVersion = \".*\"/const libVersion = \"$NEW_VERSION\"/" httpcloak.go
 
 # Update Python __init__.py version string
 echo "  -> python/httpcloak/__init__.py"
@@ -72,16 +72,48 @@ if [ -f "$SCRIPT_DIR/dotnet/HttpCloak/HttpCloak.csproj" ]; then
     sed -i "s/<Version>[0-9]*\.[0-9]*\.[0-9]*<\/Version>/<Version>$NEW_VERSION<\/Version>/" HttpCloak.csproj
 fi
 
+# Update Android library version
+echo "  -> android/httpcloak/build.gradle.kts"
+sed -i "s/^version = \"[0-9]*\.[0-9]*\.[0-9]*\"/version = \"$NEW_VERSION\"/" "$SCRIPT_DIR/android/httpcloak/build.gradle.kts"
+
+# Every file must now carry the new version. A pattern that stops matching
+# (as the clib one did when the version moved into libVersion, so 1.7.2-beta.2
+# and the first 1.7.3 bump reported the previous version) fails here instead
+# of shipping quietly.
+#
+# The paths are relative to this directory, which the glob needs too: the
+# script has moved into dotnet/HttpCloak by now, so it used to match nothing
+# and skip every npm platform package. The version must sit between quotes or
+# tags, so 1.7.3 is not satisfied by 1.7.30 or 11.7.3.
+cd "$SCRIPT_DIR"
+version_re="[\">]${NEW_VERSION//./\\.}[\"<]"
+missing=0
+for f in nodejs/package.json python/pyproject.toml python/httpcloak/__init__.py \
+         clib/httpcloak.go android/httpcloak/build.gradle.kts \
+         nodejs/npm/*/package.json dotnet/HttpCloak/HttpCloak.csproj; do
+    if [ ! -f "$f" ]; then
+        echo "ERROR: $f not found" >&2
+        missing=1
+        continue
+    fi
+    if ! grep -qE "$version_re" "$f"; then
+        echo "ERROR: $f does not contain $NEW_VERSION" >&2
+        missing=1
+    fi
+done
+[ "$missing" -eq 0 ] || exit 1
+
 echo ""
 echo "Version bumped to $NEW_VERSION successfully!"
 echo ""
 echo "Files updated:"
 echo "  - bindings/nodejs/package.json (version + optionalDependencies)"
-echo "  - bindings/nodejs/npm/*/package.json (6 platform packages)"
+echo "  - bindings/nodejs/npm/*/package.json (the platform packages)"
 echo "  - bindings/python/pyproject.toml"
 echo "  - bindings/python/httpcloak/__init__.py"
 echo "  - bindings/clib/httpcloak.go"
 echo "  - bindings/dotnet/HttpCloak/HttpCloak.csproj (if exists)"
+echo "  - bindings/android/httpcloak/build.gradle.kts"
 echo ""
 echo "Next steps:"
 echo "  1. Rebuild native libraries: cd bindings && make build"

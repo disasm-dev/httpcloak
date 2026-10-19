@@ -54,9 +54,17 @@ type HTTP2Transport struct {
 	// TLS session resumption cache (shared across connections)
 	sessionCache utls.ClientSessionCache
 
-	// Shuffle seed for consistent TLS extension order across all connections
-	// Chrome shuffles extensions once per session, not per connection
-	// Each connection needs a fresh spec (ApplyPreset mutates it), but same seed
+	// Seed passed to the spec builder. It does NOT pin the extension order, and
+	// must not be made to: Chrome redraws the permutation on every handshake,
+	// because BoringSSL keeps extension_permutation on SSL_HANDSHAKE rather than
+	// on SSL_CTX. Measured on 153.0.8010.52, one browser session opening 7
+	// parallel connections produced 7 different orders.
+	//
+	// It is inert here. The TCP parrot literals already shuffle with fresh
+	// randomness when the spec is built, and the seeded shuffle runs on top of
+	// that, so the result is fresh per connection whatever the seed is. The QUIC
+	// parrots had no such inline shuffle, which is why the same seed DID pin
+	// their order until it was removed. See fingerprint.FreshShuffleSeed.
 	shuffleSeed int64
 
 	// Cached spec presence flags - indicate if preset supports these specs
@@ -257,9 +265,8 @@ func NewHTTP2TransportWithConfig(preset *fingerprint.Preset, dnsCache *dns.Cache
 		sessionCache = NewPersistableSessionCache()
 	}
 
-	// Generate random seed for TLS extension shuffling
-	// Chrome shuffles extensions once per session, not per connection
-	// This seed ensures consistent ordering across all connections in this transport
+	// Seed for the spec builder. It does not pin the extension order and must
+	// not be made to; see the shuffleSeed field for why it is inert here.
 	var seedBytes [8]byte
 	crand.Read(seedBytes[:])
 	shuffleSeed := int64(binary.LittleEndian.Uint64(seedBytes[:]))
@@ -307,12 +314,53 @@ func NewHTTP2TransportWithConfig(preset *fingerprint.Preset, dnsCache *dns.Cache
 	return t
 }
 
+// maxHTTP2Retries is how many times a request that failed before its response
+// headers is sent again, so it goes out at most maxHTTP2Retries+1 times. It is
+// Chrome's kMaxRetryAttempts, one budget shared by every retryable reason.
+// Measured against Chrome 155: two refusals and the third send lands, three and
+// the load fails after exactly three HEADERS, all on one connection.
+const maxHTTP2Retries = 2
+
+// isRefusedStream reports a RST_STREAM(REFUSED_STREAM) from the server.
+func isRefusedStream(err error) bool {
+	var se http2.StreamError
+	return errors.As(err, &se) && se.Code == http2.ErrCodeRefusedStream
+}
+
+// retryableHTTP2Request narrows the fork's retry predicate to Chrome's list.
+// The fork also replays a RST_STREAM(PROTOCOL_ERROR) from the peer, inherited
+// from golang/go#47635. Chrome maps that to ERR_HTTP2_PROTOCOL_ERROR, which is
+// not on its retry list, and fails after one send.
+func retryableHTTP2Request(req *http.Request, err error) (*http.Request, error) {
+	var se http2.StreamError
+	if errors.As(err, &se) && se.Code != http2.ErrCodeRefusedStream {
+		return nil, err
+	}
+	return http2.ShouldRetryRequest(req, err)
+}
+
+// connClosing reports whether a connection can no longer open streams. It is
+// not CanTakeNewRequest, which is also false for a healthy connection that is
+// merely at its concurrent stream limit.
+func connClosing(c *persistentConn) bool {
+	st := c.h2Conn.State()
+	return st.Closed || st.Closing
+}
+
 // RoundTrip implements http.RoundTripper
 func (t *HTTP2Transport) RoundTrip(req *http.Request) (*http.Response, error) {
+	resp, _, err := t.roundTrip(req)
+	return resp, err
+}
+
+// roundTrip is RoundTrip, also saying whether any of the request may have
+// reached the server. sent is false only when no connection could be had for
+// the first attempt, so nothing was written.
+func (t *HTTP2Transport) roundTrip(req *http.Request) (resp *http.Response, sent bool, err error) {
 	t.connsMu.RLock()
 	if t.closed {
 		t.connsMu.RUnlock()
-		return nil, fmt.Errorf("http2: transport closed")
+		return nil, false, fmt.Errorf("http2: transport closed")
 	}
 	t.connsMu.RUnlock()
 
@@ -328,7 +376,7 @@ func (t *HTTP2Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 	// Try to get existing connection (pass request host for SNI, connectHost used internally for DNS)
 	conn, err := t.getOrCreateConn(req.Context(), host, port, key)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 
 	// Mark conn as in-use so cleanup() doesn't close it mid-flight
@@ -338,19 +386,29 @@ func (t *HTTP2Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 	conn.mu.Unlock()
 
 	// Make request
-	resp, err := conn.h2Conn.RoundTrip(req)
-	if err != nil {
+	resp, err = conn.h2Conn.RoundTrip(req)
+	for attempt := 0; err != nil; attempt++ {
 		// release(), not a bare decrement: if this conn was evicted while the
 		// request was in flight its close was deferred, and only release()
 		// fires it once the count reaches zero.
 		conn.release()
 
-		// Connection might be dead, remove it before deciding anything.
-		t.removeConn(key)
+		// A refused stream closes one stream and says nothing about the
+		// connection, so Chrome resends on the session it already has. Every
+		// other failure, and a refusal on a connection that is closing anyway,
+		// means the connection is gone and the next attempt needs a new one.
+		if !isRefusedStream(err) || connClosing(conn) {
+			t.removeConn(key)
+		}
 
 		// Don't retry if context is already done (e.g. timeout expired)
 		if req.Context().Err() != nil {
-			return nil, req.Context().Err()
+			return nil, true, req.Context().Err()
+		}
+
+		// Chrome's budget: kMaxRetryAttempts in http_network_transaction.cc.
+		if attempt == maxHTTP2Retries {
+			return nil, true, err
 		}
 
 		// Ask whether this is a failure worth replaying, and get the request
@@ -366,31 +424,27 @@ func (t *HTTP2Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 		// a comment describing the same failure.
 		//
 		// And the classification: a browser replays a refused stream or a
-		// graceful GOAWAY, and gives up on RST_STREAM(INTERNAL_ERROR) before
-		// headers, and never makes a second HTTP/2 attempt after
-		// HTTP_1_1_REQUIRED. Retrying everything produced two HEADERS arrivals
-		// where a real client produces one, on exactly the errors a server
-		// chooses to send.
-		retryReq, retryErr := http2.ShouldRetryRequest(req, err)
+		// graceful GOAWAY, and gives up on RST_STREAM(INTERNAL_ERROR) or
+		// RST_STREAM(PROTOCOL_ERROR) before headers, and never makes a second
+		// HTTP/2 attempt after HTTP_1_1_REQUIRED. Retrying everything produced
+		// two HEADERS arrivals where a real client produces one, on exactly the
+		// errors a server chooses to send.
+		retryReq, retryErr := retryableHTTP2Request(req, err)
 		if retryErr != nil || retryReq == nil {
-			return nil, err
+			return nil, true, err
 		}
+		req = retryReq
 
 		conn, err = t.getOrCreateConn(req.Context(), host, port, key)
 		if err != nil {
-			return nil, err
+			return nil, true, err
 		}
 
 		conn.mu.Lock()
 		conn.inFlight++
 		conn.mu.Unlock()
 
-		resp, err = conn.h2Conn.RoundTrip(retryReq)
-		if err != nil {
-			conn.release()
-			t.removeConn(key)
-			return nil, err
-		}
+		resp, err = conn.h2Conn.RoundTrip(req)
 	}
 
 	// Keep the connection marked in-use until the caller finishes with the body.
@@ -408,7 +462,7 @@ func (t *HTTP2Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 		resp.Body = &connBodyGuard{ReadCloser: resp.Body, conn: conn}
 	}
 
-	return resp, nil
+	return resp, true, nil
 }
 
 // isHTTP2StreamError reports whether an HTTP/2 attempt failed on its stream (a
@@ -471,9 +525,12 @@ func (t *HTTP2Transport) getOrCreateConn(ctx context.Context, host, port, key st
 	// leader is set only inside the closure singleflight actually executes (the
 	// winner); coalesced waiters pass their own closures which never run, so their
 	// leader stays false. This lets a waiter recognise when it received the
-	// leader's result and react differently for connection-bearing errors.
+	// leader's result and react differently for connection-bearing errors. The
+	// closure runs on its own goroutine, and its write to leader happens before
+	// the result is sent on the channel, so reading leader after receiving is
+	// safe.
 	leader := false
-	v, err, _ := t.dialGroup.Do(key, func() (interface{}, error) {
+	ch := t.dialGroup.DoChan(key, func() (interface{}, error) {
 		leader = true
 		// A usable conn may have been published between our checks above and
 		// winning the singleflight slot.
@@ -526,6 +583,26 @@ func (t *HTTP2Transport) getOrCreateConn(ctx context.Context, host, port, key st
 		t.connsMu.Unlock()
 		return newConn, nil
 	})
+
+	// Every caller, the leader included, stops waiting when its own context
+	// ends. The dial itself runs detached and carries on for the others; a
+	// connection it opens is published to the pool, so nothing is lost. The one
+	// thing nobody would own is the live connection an ALPN downgrade hands to
+	// the leader, so a leader that leaves closes it once the dial returns.
+	var res singleflight.Result
+	select {
+	case res = <-ch:
+	case <-ctx.Done():
+		go func() {
+			r := <-ch
+			var alpnErr *ALPNMismatchError
+			if leader && errors.As(r.Err, &alpnErr) && alpnErr.TLSConn != nil {
+				alpnErr.TLSConn.Close()
+			}
+		}()
+		return nil, ctx.Err()
+	}
+	v, err := res.Val, res.Err
 	if err != nil {
 		// An ALPN downgrade returns a single live TLS connection carried inside
 		// the error, meant for ONE owner to serve over HTTP/1.1. singleflight
@@ -777,7 +854,7 @@ func (t *HTTP2Transport) establishConn(ctx context.Context, host, port string, s
 	// the client's real list, so overwriting it there would undo the capture.
 	if specSource == fingerprint.SourceClientHelloID {
 		fingerprint.ApplySignatureAlgorithms(specToUse.Extensions, t.preset.SignatureAlgorithms)
-		fingerprint.ApplyTrustAnchors(&specToUse.Extensions, t.preset.TrustAnchors, utls.PermutesExtensions(t.preset.ClientHelloID))
+		fingerprint.ApplyTrustAnchors(&specToUse.Extensions, t.preset.TrustAnchors)
 	}
 
 	// Fetch ECH config if needed. skipECH forces a no-ECH handshake, used by the
@@ -913,7 +990,7 @@ func (t *HTTP2Transport) establishConn(ctx context.Context, host, port string, s
 			// Keep the same TCP signature_algorithms override on the fallback spec.
 			if fallbackJA3 == "" && fallbackSpec != nil {
 				fingerprint.ApplySignatureAlgorithms(fallbackSpec.Extensions, t.preset.SignatureAlgorithms)
-				fingerprint.ApplyTrustAnchors(&fallbackSpec.Extensions, t.preset.TrustAnchors, utls.PermutesExtensions(t.preset.ClientHelloID))
+				fingerprint.ApplyTrustAnchors(&fallbackSpec.Extensions, t.preset.TrustAnchors)
 			}
 
 			// Redo TLS handshake on the clean connection

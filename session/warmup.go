@@ -16,7 +16,7 @@ import (
 type resourceType int
 
 const (
-	resourceCSS   resourceType = iota
+	resourceCSS resourceType = iota
 	resourceJS
 	resourceImage
 	resourceFont
@@ -24,8 +24,8 @@ const (
 
 // subresource is a URL discovered in the HTML with its type.
 type subresource struct {
-	url  string
-	typ  resourceType
+	url string
+	typ resourceType
 }
 
 // maxSubresources caps how many subresources we fetch.
@@ -245,6 +245,10 @@ func groupByPriority(resources []subresource) (cssAndFonts, scripts, images []su
 // fetchBatch fetches a batch of subresources concurrently (up to concurrencyLimit).
 // Errors are silently ignored (matches browser behavior).
 func fetchBatch(ctx context.Context, s *Session, batch []subresource, pageURL string) {
+	var preset *fingerprint.Preset
+	if s.Config != nil && s.Config.Preset != "" {
+		preset = fingerprint.Get(s.Config.Preset)
+	}
 	sem := make(chan struct{}, concurrencyLimit)
 	var wg sync.WaitGroup
 
@@ -264,7 +268,7 @@ func fetchBatch(ctx context.Context, s *Session, batch []subresource, pageURL st
 				return
 			}
 
-			headers := buildSubresourceHeaders(r.typ, pageURL, r.url)
+			headers := buildSubresourceHeaders(preset, r.typ, pageURL, r.url)
 			req := &transport.Request{
 				Method:  "GET",
 				URL:     r.url,
@@ -297,7 +301,7 @@ func fetchBatch(ctx context.Context, s *Session, batch []subresource, pageURL st
 
 // buildSubresourceHeaders returns the headers for a subresource request,
 // overriding the preset's navigation defaults with per-type values.
-func buildSubresourceHeaders(typ resourceType, pageURL, targetURL string) map[string][]string {
+func buildSubresourceHeaders(preset *fingerprint.Preset, typ resourceType, pageURL, targetURL string) map[string][]string {
 	var reqCtx fingerprint.RequestContext
 	var accept, priority string
 
@@ -312,7 +316,7 @@ func buildSubresourceHeaders(typ resourceType, pageURL, targetURL string) map[st
 		priority = "u=1"
 	case resourceImage:
 		reqCtx = fingerprint.ImageContext(pageURL, targetURL)
-		accept = "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8"
+		accept = preset.ResolveImageAccept()
 		priority = "u=2"
 	case resourceFont:
 		reqCtx = fingerprint.FontContext(pageURL, targetURL)
@@ -322,13 +326,25 @@ func buildSubresourceHeaders(typ resourceType, pageURL, targetURL string) map[st
 
 	secFetch := fingerprint.GenerateSecFetchHeaders(reqCtx)
 
+	// The constants above are only a fallback for presets without a priority
+	// table (Safari and iOS, never measured here). Every other preset sends
+	// what its browser sends for the dest; the transport would apply the same
+	// table again, so this keeps the two layers from disagreeing.
+	if preset != nil {
+		if _, _, hv, ok := preset.H2PriorityFor(secFetch.Dest); ok {
+			priority = hv
+		}
+	}
+
 	headers := map[string][]string{
-		"Accept":          {accept},
-		"Sec-Fetch-Site":  {secFetch.Site},
-		"Sec-Fetch-Mode":  {secFetch.Mode},
-		"Sec-Fetch-Dest":  {secFetch.Dest},
-		"Referer":         {pageURL},
-		"Priority":        {priority},
+		"Accept":         {accept},
+		"Sec-Fetch-Site": {secFetch.Site},
+		"Sec-Fetch-Mode": {secFetch.Mode},
+		"Sec-Fetch-Dest": {secFetch.Dest},
+		"Referer":        {pageURL},
+	}
+	if priority != "" {
+		headers["Priority"] = []string{priority}
 	}
 
 	return headers

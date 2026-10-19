@@ -201,7 +201,7 @@ public sealed class Session : IDisposable
     /// <summary>
     /// Create a new session with the specified options.
     /// </summary>
-    /// <param name="preset">Browser preset (default: "chrome-146")</param>
+    /// <param name="preset">Browser preset (default: "chrome-latest")</param>
     /// <param name="proxy">Proxy URL (e.g., "http://user:pass@host:port" or "socks5://host:port")</param>
     /// <param name="tcpProxy">Proxy URL for TCP protocols (HTTP/1.1, HTTP/2) - use with udpProxy for split config</param>
     /// <param name="udpProxy">Proxy URL for UDP protocols (HTTP/3 via MASQUE) - use with tcpProxy for split config</param>
@@ -233,7 +233,7 @@ public sealed class Session : IDisposable
     /// <param name="tcpWindowScale">TCP Window Scale override: 8=Windows, 7=Linux, 6=macOS (default: null)</param>
     /// <param name="tcpDf">IP Don't Fragment bit override (default: null)</param>
     public Session(
-        string preset = "chrome-146",
+        string preset = "chrome-latest",
         string? proxy = null,
         string? tcpProxy = null,
         string? udpProxy = null,
@@ -466,7 +466,7 @@ public sealed class Session : IDisposable
         stopwatch.Stop();
 
         if (responseHandle < 0)
-            throw new HttpCloakException("Request failed");
+            throw new HttpCloakException(LastErrorOr("Request failed"));
 
         return ParseRawResponse(responseHandle, stopwatch.Elapsed);
     }
@@ -532,7 +532,7 @@ public sealed class Session : IDisposable
         stopwatch.Stop();
 
         if (responseHandle < 0)
-            throw new HttpCloakException("Request failed");
+            throw new HttpCloakException(LastErrorOr("Request failed"));
 
         return ParseRawResponse(responseHandle, stopwatch.Elapsed);
     }
@@ -677,7 +677,7 @@ public sealed class Session : IDisposable
         stopwatch.Stop();
 
         if (responseHandle < 0)
-            throw new HttpCloakException("Request failed");
+            throw new HttpCloakException(LastErrorOr("Request failed"));
 
         return ParseRawResponse(responseHandle, stopwatch.Elapsed);
     }
@@ -880,7 +880,7 @@ public sealed class Session : IDisposable
         stopwatch.Stop();
 
         if (responseHandle < 0)
-            throw new HttpCloakException("Request failed");
+            throw new HttpCloakException(LastErrorOr("Request failed"));
 
         return ParseRawResponse(responseHandle, stopwatch.Elapsed);
     }
@@ -1972,7 +1972,7 @@ public sealed class Session : IDisposable
 
         long streamHandle = Native.StreamGet(_handle, url, optionsJson);
         if (streamHandle < 0)
-            throw new HttpCloakException("Failed to start streaming request");
+            throw new HttpCloakException(LastErrorOr("Failed to start streaming request"));
 
         return CreateStreamResponse(streamHandle);
     }
@@ -2002,7 +2002,7 @@ public sealed class Session : IDisposable
 
         long streamHandle = Native.StreamPost(_handle, url, body, optionsJson);
         if (streamHandle < 0)
-            throw new HttpCloakException("Failed to start streaming request");
+            throw new HttpCloakException(LastErrorOr("Failed to start streaming request"));
 
         return CreateStreamResponse(streamHandle);
     }
@@ -2044,7 +2044,7 @@ public sealed class Session : IDisposable
 
         long streamHandle = Native.StreamRequest(_handle, requestJson);
         if (streamHandle < 0)
-            throw new HttpCloakException("Failed to start streaming request");
+            throw new HttpCloakException(LastErrorOr("Failed to start streaming request"));
 
         return CreateStreamResponse(streamHandle);
     }
@@ -2078,6 +2078,17 @@ public sealed class Session : IDisposable
         }
 
         return new StreamResponse(streamHandle, metadata);
+    }
+
+    /// <summary>
+    /// Why the most recent handle-returning call on this session failed. Those
+    /// calls return -1 and cannot carry a message, so without this every
+    /// failure, from invalid request JSON to a refused connection, read the same.
+    /// </summary>
+    private string LastErrorOr(string fallback)
+    {
+        var message = Native.PtrToStringAndFree(Native.LastError(_handle));
+        return string.IsNullOrEmpty(message) ? fallback : message;
     }
 
     // Same raw-path plumbing as ParseFastResponse, but materialises a regular
@@ -2207,7 +2218,7 @@ public sealed class Session : IDisposable
         stopwatch.Stop();
 
         if (responseHandle < 0)
-            throw new HttpCloakException("Request failed");
+            throw new HttpCloakException(LastErrorOr("Request failed"));
 
         return ParseFastResponse(responseHandle, stopwatch.Elapsed);
     }
@@ -2254,7 +2265,7 @@ public sealed class Session : IDisposable
         stopwatch.Stop();
 
         if (responseHandle < 0)
-            throw new HttpCloakException("Request failed");
+            throw new HttpCloakException(LastErrorOr("Request failed"));
 
         return ParseFastResponse(responseHandle, stopwatch.Elapsed);
     }
@@ -2311,7 +2322,7 @@ public sealed class Session : IDisposable
         stopwatch.Stop();
 
         if (responseHandle < 0)
-            throw new HttpCloakException("Request failed");
+            throw new HttpCloakException(LastErrorOr("Request failed"));
 
         return ParseFastResponse(responseHandle, stopwatch.Elapsed);
     }
@@ -3371,6 +3382,25 @@ public sealed class StreamResponse : IDisposable
             throw new ObjectDisposedException(nameof(StreamResponse));
     }
 
+    /// <summary>
+    /// The trailer fields the server sent after the body, which is where gRPC
+    /// puts its status. Call it once the body has been read to the end:
+    /// trailers arrive after the body, so unlike <see cref="Response.Trailer"/>
+    /// this cannot be set when the stream opens. Before the end it reports the
+    /// names the response announced in its Trailer header, each with no values,
+    /// because that is all the server has sent so far.
+    /// </summary>
+    public IReadOnlyDictionary<string, string[]> GetTrailer()
+    {
+        if (_disposed)
+            return new Dictionary<string, string[]>();
+        var json = Native.PtrToStringAndFree(Native.StreamTrailer(_handle));
+        if (string.IsNullOrEmpty(json))
+            return new Dictionary<string, string[]>();
+        return JsonSerializer.Deserialize(json, JsonContext.Default.DictionaryStringStringArray)
+            ?? new Dictionary<string, string[]>();
+    }
+
     public void Dispose()
     {
         if (!_disposed)
@@ -3481,7 +3511,37 @@ public static class Presets
     public const string ChromeLatestIos = "chrome-latest-ios";
     public const string ChromeLatestAndroid = "chrome-latest-android";
 
-    // Chrome 149 (desktop; wire fingerprint identical to 148)
+    // Chrome 153 (headers-only over 152; no iOS preset until one is captured)
+    public const string Chrome153 = "chrome-153";
+    public const string Chrome153Windows = "chrome-153-windows";
+    public const string Chrome153Linux = "chrome-153-linux";
+    public const string Chrome153MacOS = "chrome-153-macos";
+    public const string Chrome153Android = "chrome-153-android";
+
+    // Chrome 154 (headers-only over 153)
+    public const string Chrome154 = "chrome-154";
+    public const string Chrome154Windows = "chrome-154-windows";
+    public const string Chrome154Linux = "chrome-154-linux";
+    public const string Chrome154MacOS = "chrome-154-macos";
+    public const string Chrome154Android = "chrome-154-android";
+
+    // Chrome 155 (desktop and Android add image/jxl to Accept; TLS unchanged; iOS captured)
+    public const string Chrome155 = "chrome-155";
+    public const string Chrome155Windows = "chrome-155-windows";
+    public const string Chrome155Linux = "chrome-155-linux";
+    public const string Chrome155MacOS = "chrome-155-macos";
+    public const string Chrome155IOS = "chrome-155-ios";
+    public const string Chrome155Android = "chrome-155-android";
+
+    // Chrome 152 (trust anchors, plus a greased signature algorithm on TCP)
+    public const string Chrome152 = "chrome-152";
+    public const string Chrome152Windows = "chrome-152-windows";
+    public const string Chrome152Linux = "chrome-152-linux";
+    public const string Chrome152MacOS = "chrome-152-macos";
+    public const string Chrome152Android = "chrome-152-android";
+    public const string Chrome152IOS = "chrome-152-ios";
+
+    // Chrome 151 (headers only over 150)
     public const string Chrome151 = "chrome-151";
     public const string Chrome151Windows = "chrome-151-windows";
     public const string Chrome151Linux = "chrome-151-linux";
@@ -3716,7 +3776,7 @@ public class MultipartFile
 internal class SessionConfig
 {
     [JsonPropertyName("preset")]
-    public string Preset { get; set; } = "chrome-146";
+    public string Preset { get; set; } = "chrome-latest";
 
     [JsonPropertyName("proxy")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
@@ -4233,14 +4293,14 @@ public sealed class HttpCloakHandler : DelegatingHandler
     /// Create a new HttpCloakHandler with the specified options.
     /// Uses LocalProxy internally for true streaming support.
     /// </summary>
-    /// <param name="preset">Browser preset (default: "chrome-146")</param>
+    /// <param name="preset">Browser preset (default: "chrome-latest")</param>
     /// <param name="proxy">Upstream proxy URL (e.g., "http://user:pass@host:port" or "socks5://host:port")</param>
     /// <param name="tcpProxy">Upstream proxy URL for TCP protocols (HTTP/1.1, HTTP/2)</param>
     /// <param name="udpProxy">Upstream proxy URL for UDP protocols (HTTP/3 via MASQUE)</param>
     /// <param name="timeout">Request timeout in seconds (default: 30)</param>
     /// <param name="maxConnections">Maximum concurrent connections (default: 1000)</param>
     public HttpCloakHandler(
-        string preset = "chrome-146",
+        string preset = "chrome-latest",
         string? proxy = null,
         string? tcpProxy = null,
         string? udpProxy = null,

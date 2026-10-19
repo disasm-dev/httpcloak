@@ -1891,7 +1891,7 @@ func (t *HTTP1Transport) applyH1Spec(
 	// undo the capture.
 	if source == fingerprint.SourceClientHelloID {
 		fingerprint.ApplySignatureAlgorithms(spec.Extensions, t.preset.SignatureAlgorithms)
-		fingerprint.ApplyTrustAnchors(&spec.Extensions, t.preset.TrustAnchors, utls.PermutesExtensions(t.preset.ClientHelloID))
+		fingerprint.ApplyTrustAnchors(&spec.Extensions, t.preset.TrustAnchors)
 	}
 
 	conn := utls.UClient(rawConn, tlsConfig, utls.HelloCustom)

@@ -325,7 +325,7 @@ func startH2Server(t *testing.T, cfg h2Config) *h2Server {
 		t.Fatalf("listen: %v", err)
 	}
 	s := &h2Server{addr: raw.Addr().String(), cfg: cfg}
-	ln := tls.NewListener(&countingListener{Listener: raw, n: &s.rawIn}, &tls.Config{
+	ln := tls.NewListener(&byteCountingListener{Listener: raw, n: &s.rawIn}, &tls.Config{
 		Certificates: []tls.Certificate{{Certificate: [][]byte{der}, PrivateKey: key}},
 		NextProtos:   []string{"h2"},
 	})
@@ -349,26 +349,26 @@ func startH2Server(t *testing.T, cfg h2Config) *h2Server {
 
 func (s *h2Server) url(path string) string { return "https://" + s.addr + path }
 
-// countingListener adds every byte its connections read to n.
-type countingListener struct {
+// byteCountingListener adds every byte its connections read to n.
+type byteCountingListener struct {
 	net.Listener
 	n *atomic.Int64
 }
 
-func (l *countingListener) Accept() (net.Conn, error) {
+func (l *byteCountingListener) Accept() (net.Conn, error) {
 	c, err := l.Listener.Accept()
 	if err != nil {
 		return nil, err
 	}
-	return &countingConn{Conn: c, n: l.n}, nil
+	return &byteCountingConn{Conn: c, n: l.n}, nil
 }
 
-type countingConn struct {
+type byteCountingConn struct {
 	net.Conn
 	n *atomic.Int64
 }
 
-func (c *countingConn) Read(b []byte) (int, error) {
+func (c *byteCountingConn) Read(b []byte) (int, error) {
 	n, err := c.Conn.Read(b)
 	c.n.Add(int64(n))
 	return n, err
