@@ -224,7 +224,7 @@ func (c *Client) DoStream(ctx context.Context, req *Request) (*StreamResponse, e
 			return nil, fmt.Errorf("HTTP/1.1 failed: %w", err)
 		}
 	default:
-		// Auto mode: try H3 -> H2 -> H1 with fallback
+		// Auto mode: H3 when shouldTryHTTP3 allows it, then H2, then H1
 		if useH3 {
 			resp, usedProtocol, err = c.doHTTP3(ctx, host, port, httpReq, timing, startTime)
 			if err != nil {
@@ -250,6 +250,9 @@ func (c *Client) DoStream(ctx context.Context, req *Request) (*StreamResponse, e
 			return nil, err
 		}
 	}
+
+	// Alt-Svc, as in Do: it decides whether later requests may use HTTP/3.
+	c.altSvc.Learn(host, port, resp.Header.Values("Alt-Svc"), time.Now())
 
 	// Build response headers map (multi-value support)
 	headers := make(map[string][]string)

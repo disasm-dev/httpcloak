@@ -89,6 +89,8 @@ func Transport(o Options) *http2.Transport {
 		PrefacePingIdle: p.H2PrefacePingIdle(),
 		PrefacePingHang: p.H2PrefacePingHang(),
 
+		ChromeSessionErrors: p.H2ChromeSessionErrors(),
+
 		ConnectionFlow:     s.ConnectionWindowUpdate,
 		Settings:           Settings(s),
 		SettingsOrder:      SettingsOrder(p),
@@ -135,6 +137,7 @@ func Transport(o Options) *http2.Transport {
 		StreamPriorityMode:   StreamPriorityMode(p.H2StreamPriorityMode()),
 		HPACKIndexingPolicy:  HPACKIndexingPolicy(p.H2HPACKIndexingPolicy()),
 		DataFrameMaxSize:     p.H2DataFrameMaxSize(),
+		HeadersFrameMaxSize:  p.H2HeadersFrameMaxSize(),
 		HPACKRepresentations: HPACKRepresentations(p.H2HPACKRepresentation()),
 		HPACKNeverIndex:      p.H2HPACKNeverIndex(),
 	}

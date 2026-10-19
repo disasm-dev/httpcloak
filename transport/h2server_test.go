@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -44,9 +45,11 @@ const (
 	frHeaders      = 0x1
 	frRSTStream    = 0x3
 	frSettings     = 0x4
+	frPushPromise  = 0x5
 	frPing         = 0x6
 	frGoAway       = 0x7
 	frWindowUpdate = 0x8
+	frContinuation = 0x9
 )
 
 const (
@@ -87,6 +90,8 @@ func (f h2Frame) name() string {
 		return "GOAWAY"
 	case frWindowUpdate:
 		return "WINDOW_UPDATE"
+	case frContinuation:
+		return "CONTINUATION"
 	}
 	return fmt.Sprintf("type=%d", f.Type)
 }
@@ -140,6 +145,10 @@ type h2Config struct {
 	// client sees an unknown length, which adds a trailing empty DATA frame.
 	SendContentLength bool
 
+	// ResponseHeaders, when set, is called for every response and its headers
+	// added, lowercase names. A func so a test can change them mid-run.
+	ResponseHeaders func() map[string]string
+
 	// Chunk splits the response body into frames of at most this many bytes,
 	// each separated by ChunkDelay. Zero sends the body as one frame.
 	Chunk      int
@@ -166,6 +175,11 @@ type h2Config struct {
 	// a response, at the point it would otherwise have replied, so a request
 	// with a body has finished sending it first.
 	ResetStreams map[int]uint32
+
+	// AfterResponse runs once a response has been sent in full, END_STREAM
+	// included, with a way to write raw frames. Used to put a protocol
+	// violation or a GOAWAY on a connection at a known point.
+	AfterResponse func(write func(typ, flags byte, streamID uint32, payload []byte), streamID uint32)
 }
 
 // ------------------------------------------------------------------- server
@@ -173,6 +187,12 @@ type h2Config struct {
 type h2Server struct {
 	addr string
 	cfg  h2Config
+
+	// rawIn counts the TLS bytes read from every client connection, below the
+	// record layer, so an alert that decrypts to nothing still shows up.
+	// ended counts connections whose serve loop has returned.
+	rawIn atomic.Int64
+	ended atomic.Int32
 
 	mu       sync.Mutex
 	frames   []h2Frame
@@ -300,16 +320,17 @@ func startH2Server(t *testing.T, cfg h2Config) *h2Server {
 	if err != nil {
 		t.Fatalf("cert: %v", err)
 	}
-	ln, err := tls.Listen("tcp", "127.0.0.1:0", &tls.Config{
-		Certificates: []tls.Certificate{{Certificate: [][]byte{der}, PrivateKey: key}},
-		NextProtos:   []string{"h2"},
-	})
+	raw, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
+	s := &h2Server{addr: raw.Addr().String(), cfg: cfg}
+	ln := tls.NewListener(&countingListener{Listener: raw, n: &s.rawIn}, &tls.Config{
+		Certificates: []tls.Certificate{{Certificate: [][]byte{der}, PrivateKey: key}},
+		NextProtos:   []string{"h2"},
+	})
 	t.Cleanup(func() { ln.Close() })
 
-	s := &h2Server{addr: ln.Addr().String(), cfg: cfg}
 	go func() {
 		for {
 			c, err := ln.Accept()
@@ -327,6 +348,31 @@ func startH2Server(t *testing.T, cfg h2Config) *h2Server {
 }
 
 func (s *h2Server) url(path string) string { return "https://" + s.addr + path }
+
+// countingListener adds every byte its connections read to n.
+type countingListener struct {
+	net.Listener
+	n *atomic.Int64
+}
+
+func (l *countingListener) Accept() (net.Conn, error) {
+	c, err := l.Listener.Accept()
+	if err != nil {
+		return nil, err
+	}
+	return &countingConn{Conn: c, n: l.n}, nil
+}
+
+type countingConn struct {
+	net.Conn
+	n *atomic.Int64
+}
+
+func (c *countingConn) Read(b []byte) (int, error) {
+	n, err := c.Conn.Read(b)
+	c.n.Add(int64(n))
+	return n, err
+}
 
 // h2Conn is the per-connection state: the write side is serialised through wmu
 // because the response goroutines and the read loop both write.
@@ -365,6 +411,7 @@ type h2Conn struct {
 }
 
 func (s *h2Server) serve(c net.Conn, connID int) {
+	defer s.ended.Add(1)
 	defer c.Close()
 	c.SetDeadline(time.Now().Add(120 * time.Second))
 
@@ -402,7 +449,37 @@ func (s *h2Server) serve(c net.Conn, connID int) {
 	var (
 		hdr      [9]byte
 		reqCount int
+
+		// A header block that did not end in its HEADERS frame, waiting for
+		// the CONTINUATION frames that finish it.
+		pendingStream uint32
+		pendingFlags  byte
+		pendingBlock  []byte
 	)
+	// finishHeaders runs once a whole header block has arrived.
+	finishHeaders := func(streamID uint32, flags byte, block []byte) {
+		fields := map[string]string{}
+		hc.dec.SetEmitFunc(func(hf hpack.HeaderField) { fields[hf.Name] = hf.Value })
+		hc.dec.Write(block)
+		s.mu.Lock()
+		s.blocks = append(s.blocks, append([]byte(nil), block...))
+		s.headers = append(s.headers, fields)
+		s.mu.Unlock()
+
+		hc.fcMu.Lock()
+		if _, ok := hc.streamWin[streamID]; !ok {
+			hc.streamWin[streamID] = hc.initialWin
+		}
+		hc.fcMu.Unlock()
+
+		reqCount++
+		if s.cfg.OnRequest != nil {
+			s.cfg.OnRequest(streamID, reqCount)
+		}
+		if flags&flEndStream != 0 || !s.cfg.ReadToEndStream {
+			go hc.respond(streamID)
+		}
+	}
 	for {
 		if _, err := io.ReadFull(c, hdr[:]); err != nil {
 			return
@@ -457,28 +534,22 @@ func (s *h2Server) serve(c net.Conn, connID int) {
 			if flags&flPriority != 0 && len(block) >= 5 {
 				block = block[5:]
 			}
-			fields := map[string]string{}
-			hc.dec.SetEmitFunc(func(hf hpack.HeaderField) { fields[hf.Name] = hf.Value })
-			hc.dec.Write(block)
-			s.mu.Lock()
-			s.blocks = append(s.blocks, append([]byte(nil), block...))
-			s.headers = append(s.headers, fields)
-			s.mu.Unlock()
-
-			hc.fcMu.Lock()
-			if _, ok := hc.streamWin[streamID]; !ok {
-				hc.streamWin[streamID] = hc.initialWin
-			}
-			hc.fcMu.Unlock()
-
-			reqCount++
-			if s.cfg.OnRequest != nil {
-				s.cfg.OnRequest(streamID, reqCount)
-			}
 			if flags&flEndHeaders != 0 {
-				if flags&flEndStream != 0 || !s.cfg.ReadToEndStream {
-					go hc.respond(streamID)
-				}
+				finishHeaders(streamID, flags, block)
+			} else {
+				pendingStream, pendingFlags = streamID, flags
+				pendingBlock = append([]byte(nil), block...)
+			}
+
+		case frContinuation:
+			if streamID != pendingStream || pendingBlock == nil {
+				return
+			}
+			pendingBlock = append(pendingBlock, payload...)
+			if flags&flEndHeaders != 0 {
+				block := pendingBlock
+				pendingBlock = nil
+				finishHeaders(streamID, pendingFlags, block)
 			}
 
 		case frData:
@@ -630,6 +701,13 @@ func (hc *h2Conn) respond(streamID uint32) {
 			Value: strconv.Itoa(len(body)),
 		})
 	}
+	var extra map[string]string
+	if cfg.ResponseHeaders != nil {
+		extra = cfg.ResponseHeaders()
+	}
+	for name, value := range extra {
+		enc.WriteField(hpack.HeaderField{Name: name, Value: value})
+	}
 	hc.writeFrame(frHeaders, flEndHeaders, streamID, []byte(buf.String()))
 
 	hc.fcMu.Lock()
@@ -679,5 +757,9 @@ func (hc *h2Conn) respond(streamID uint32) {
 
 	for _, extra := range cfg.MidSettings[n] {
 		hc.writeSettings(extra, 0)
+	}
+
+	if cfg.AfterResponse != nil {
+		cfg.AfterResponse(hc.writeFrame, streamID)
 	}
 }

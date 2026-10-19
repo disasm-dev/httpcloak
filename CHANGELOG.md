@@ -5,6 +5,54 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+Wire differences from Chrome, each checked against the Chromium, quiche or BoringSSL source it copies. Most of the fixes live in the `net`, `quic-go` and `utls` forks, so this needs fork releases carrying them; until those are tagged, `go.mod` and `bindings/clib/go.mod` point at local checkouts through `replace` directives.
+
+### Added
+
+- **`httpcloak_request_raw_async` in the C library**: the request body goes in as bytes beside the request JSON, and the response comes back as meta JSON plus the body bytes on one process-wide callback set with `httpcloak_set_raw_callback`; `httpcloak_cancel_raw_request` aborts one by the id the caller chose. `httpcloak_request_async` carried both bodies inside the JSON, which meant base64 for anything not UTF-8, JSON escaping for everything else and a validity scan of every body, plus a register and unregister call per request. A 300 KB page cost the .NET host 5.7 MB of allocation per request through that path and 0.9 MB through this one.
+
+### Changed
+
+- **Auto mode no longer tries QUIC against a host that never advertised HTTP/3**: it raced QUIC against TCP on the first request to every host, a connection Chrome never opens. Chromium creates a QUIC job only for an alternative service learned from an `Alt-Svc` header, or for a DNS HTTPS record offering `h3`. Auto mode now does the same: the race only dials QUIC for a host with an unexpired `Alt-Svc` `h3` entry on its own host and port, or, on a direct connection to port 443, an HTTPS record for the name offering `h3` (looked up alongside the TCP dial, so it costs H2 nothing). A host already on HTTP/2 that later sends `Alt-Svc` for `h3` keeps its live connection for that request while HTTP/3 comes up in the background and takes over once it is up, which is what Chrome does with a live session; a failed attempt backs off from 5 minutes, doubling, as Chrome marks a broken alternative service. `Alt-Svc: clear` withdraws the entry. The older `client` package (`httpcloak.New`) tried HTTP/3 first on streamed requests; a direct connection there now waits for `Alt-Svc` too, and a SOCKS5 or MASQUE proxy keeps its preference for HTTP/3.
+
+### Fixed
+
+- **`trust_anchors` takes a random place among the extensions**: it was inserted after the spec had been shuffled, so it always sat just before the closing GREASE extension. BoringSSL permutes it with everything else, so a single Chrome 152 hello matches that position one time in seventeen and three hellos rule it out. A permuting spec now places it uniformly among the movable slots; a non-permuting one keeps the fixed slot.
+
+- **No TLS `close_notify` on a Chromium profile**: `SSLClientSocketImpl::Disconnect` drops the socket without `SSL_shutdown`, so Chrome never sends the alert, while every close here sent one. Chromium profiles now end the connection at the TCP layer. Firefox still sends it, as NSS does.
+
+- **Resumed sessions report the ticket age in whole seconds**: BoringSSL computes `1000 * (now.tv_sec - session->time)`, so the age a server recovers from a Chrome or Safari resumption is always a multiple of 1000ms; this reported it to the millisecond. Firefox profiles keep the millisecond age, as NSS does.
+
+- **HTTP/2 requests running at the same time are chained in the priority tree**: every HEADERS frame depended on stream 0. Chromium's `Http2PriorityDependencies` makes each new stream an exclusive child of the newest still-open stream at the same or a higher priority, so concurrent requests form a chain and a request on a quiet connection depends on stream 0.
+
+- **A header block over 16KB no longer produces an oversized HEADERS frame**: the 5 priority bytes were not counted against the frame limit, so the first frame came out at 16,389 bytes, over the 16,384 protocol maximum. Chromium profiles now also split the way quiche does, at 16,374 bytes of payload per HEADERS and CONTINUATION frame (the priority fields included in the first).
+
+- **QUIC Initial packets carry the ClientHello the way Chrome's do**: the ClientHello was cut into equal 75-byte CRYPTO frames with a PING after every second one. Chrome, through quiche's chaos protection, puts the head and the tail of a two-packet ClientHello in the first packet and the middle in the second, then splits each packet's CRYPTO data at random points, adds 2 to 10 PING frames, scatters the padding between frames and shuffles them, so no two first flights look alike. Both steps are now ports of quiche's code, randomness included.
+
+- **QUIC packet numbers start at one byte**: they were never shorter than two. quiche sizes them as the shortest encoding of four times the larger of the unacknowledged gap and the congestion window in packets, which is one byte on a fresh connection.
+
+- **The first QUIC retransmission waits 300ms**: with no RTT sample the probe timeout was twice the initial RTT, 200ms; quiche uses three times, 300ms, and after the first sample adds two mean deviations rather than four.
+
+- **QUIC packets are 1230 bytes over IPv6**: Chromium takes 20 bytes off its 1250 on an IPv6 socket, the extra length of the IPv6 header; every packet here was 1250 whatever the family.
+
+- **A response body waits for END_STREAM**: a body was read up to its `Content-Length` and closed, so when the server's END_STREAM came separately the stream was reset with `RST_STREAM(CANCEL)` on a response that had arrived in full. Chromium only treats an HTTP/2 body as complete once the stream has closed, so it waits. Buffered responses now read on to the end of the stream, END_STREAM on HTTP/2 and FIN on HTTP/3.
+
+- **The trust-anchor list keeps one order for the life of the process**: it was reshuffled for every connection. Chromium keeps the identifiers in an `absl::flat_hash_set` whose hash is seeded once per process, so one browser sends one order on every connection, TCP and QUIC alike, and the next launch sends another. The order is now drawn once per process and kept.
+
+- **A stray PING ACK or a PUSH_PROMISE gets a GOAWAY**: the GOAWAY written for a connection error was left in the write buffer and the connection closed without it. It is now sent. Chromium profiles also treat an ACK to a PING that was never sent as a protocol error and describe the error in the GOAWAY, as `SpdySession` does: `GOAWAY(0, PROTOCOL_ERROR, "Unexpected PING ACK.")` and `"PUSH_PROMISE received"`. Firefox ignores a stray ACK and sends no description, so its profiles keep doing both.
+
+- **A GOAWAY on an idle connection closes it**: the connection stayed open until the next request found it unusable or the idle sweep reached it, 90 seconds later. Chromium drains an idle session as soon as the GOAWAY arrives, without a GOAWAY of its own, and closes a busy one after its last stream. Both now happen here.
+
+- **Resuming a session survives a HelloRetryRequest**: uTLS aborted the handshake ("does not support reprocessing of PSK key triggered by HelloRetryRequest"), so the request failed. The second ClientHello now offers the session again with a recomputed ticket age and a binder over the retried transcript, as BoringSSL's does. When the server's chosen cipher suite has a different hash from the session's, the PSK is left out of the second hello, which is BoringSSL's `should_offer_psk`.
+
+- **Chromium profiles False Start on TLS 1.2**: the client waited for the server's Finished before sending anything. Chrome sets `SSL_MODE_ENABLE_FALSE_START`, so its request follows its own Finished one round trip earlier. It now does here under BoringSSL's conditions: a full handshake, ECDHE with an AEAD cipher, a negotiated ALPN protocol, and no ECH. The server's Finished is still read and verified before any response data is returned.
+
+- **A KeyUpdate request is answered with the next write**: the reply went out the moment the request arrived, so an idle connection answered on its own. BoringSSL queues it and sends it in the same write as the next application data, which RFC 8446 allows. BoringSSL profiles now do the same; Firefox and Go keep the immediate reply.
+
+- **HTTP/3 resumption only offers 0-RTT the server's ticket allows**: a resumed QUIC connection always sent `early_data`, even on a ticket issued without it, which is what Cloudflare issues on a zone with 0-RTT switched off. The server rejected the 0-RTT, and quic-go left the request on an unusable connection: `http3: conn unusable: 0-RTT rejected`. The retry was meant to leave early data out, but it only changed a TLS config that the dialer never reads, so all three attempts failed the same way. The resumed ClientHello now drops `early_data` when the ticket does not allow it, as BoringSSL does, and when the host has already rejected it. uTLS no longer derives 0-RTT keys for such a ticket either.
+
 ## [1.7.1] - 2026-09-02
 
 ### Added

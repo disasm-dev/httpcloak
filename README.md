@@ -380,7 +380,7 @@ session = httpcloak.Session(preset="chrome-latest", http_version="h2")  # Force 
 session = httpcloak.Session(preset="chrome-latest", http_version="h1")  # Force HTTP/1.1
 ```
 
-Auto mode tries HTTP/3 first, falls back gracefully.
+Auto mode picks protocols the way Chrome does: HTTP/2 (or HTTP/1.1) first, and HTTP/3 once the server advertises it through Alt-Svc or its DNS HTTPS record.
 
 ### 🖥️ TCP/IP Fingerprinting
 

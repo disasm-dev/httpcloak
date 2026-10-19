@@ -138,7 +138,8 @@ type ClientConfig struct {
 	DisableECH bool
 
 	// ForceProtocol forces a specific HTTP protocol for all requests.
-	// ProtocolAuto (default): Auto-detect with fallback (H3 -> H2 -> H1)
+	// ProtocolAuto (default): Auto-detect with fallback; HTTP/3 only for a host that
+	// advertised it, or through a SOCKS5/MASQUE proxy
 	// ProtocolHTTP1: Force HTTP/1.1 only
 	// ProtocolHTTP2: Force HTTP/2 only
 	// ProtocolHTTP3: Force HTTP/3 only
@@ -385,7 +386,7 @@ func WithForceHTTP2() Option {
 type Protocol int
 
 const (
-	ProtocolAuto  Protocol = iota // Auto-detect (H3 -> H2 -> H1 fallback)
+	ProtocolAuto  Protocol = iota // Auto-detect; H3 only once advertised (see shouldTryHTTP3)
 	ProtocolHTTP1                 // Force HTTP/1.1
 	ProtocolHTTP2                 // Force HTTP/2
 	ProtocolHTTP3                 // Force HTTP/3

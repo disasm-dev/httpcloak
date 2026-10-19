@@ -30,3 +30,11 @@ require (
 	golang.org/x/text v0.32.0 // indirect
 	golang.org/x/tools v0.39.0 // indirect
 )
+
+// Local fork checkouts carrying the Chrome-parity fixes. Drop these once the
+// forks are tagged and the requires above point at the new versions.
+replace (
+	github.com/sardanioss/net => ../httpcloak-forks/net
+	github.com/sardanioss/quic-go => ../httpcloak-forks/quic-go
+	github.com/sardanioss/utls => ../httpcloak-forks/utls
+)

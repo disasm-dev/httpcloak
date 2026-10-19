@@ -81,8 +81,12 @@ func QUICConfig(o QUICOptions) *quic.Config {
 	}
 
 	initialPacketSize := p.H3QUICInitialPacketSize()
+	initialPacketSizeIPv6 := p.H3QUICInitialPacketSizeIPv6()
 	if o.InitialPacketSize > 0 {
+		// An override is a requirement of the path (MASQUE's inner
+		// connection), and it holds whichever family the target has.
 		initialPacketSize = o.InitialPacketSize
+		initialPacketSizeIPv6 = 0
 	}
 
 	cfg := &quic.Config{
@@ -103,7 +107,8 @@ func QUICConfig(o QUICOptions) *quic.Config {
 		// profile advertises.
 		EnableDatagrams: true,
 
-		InitialPacketSize: initialPacketSize,
+		InitialPacketSize:     initialPacketSize,
+		InitialPacketSizeIPv6: initialPacketSizeIPv6,
 
 		// Path MTU discovery is off. Chromium leaves it off unless the
 		// embedder asks for it, and nothing on the ordinary navigation path
@@ -134,6 +139,7 @@ func QUICConfig(o QUICOptions) *quic.Config {
 		cfg.MaxStreamReceiveWindow = 6 * 1024 * 1024
 		cfg.InitialConnectionReceiveWindow = 15 * 1024 * 1024 / 2
 		cfg.MaxConnectionReceiveWindow = 15 * 1024 * 1024
+		cfg.InitialPacketSizeIPv6 = 0
 		return cfg
 	}
 

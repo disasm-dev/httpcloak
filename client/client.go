@@ -64,6 +64,7 @@ import (
 	"github.com/andybalholm/brotli"
 	"github.com/klauspost/compress/zstd"
 	"github.com/sardanioss/httpcloak/fingerprint"
+	"github.com/sardanioss/httpcloak/internal/altsvc"
 	"github.com/sardanioss/httpcloak/pool"
 	"github.com/sardanioss/httpcloak/protocol"
 	"github.com/sardanioss/httpcloak/transport"
@@ -73,7 +74,8 @@ import (
 // No manual seeding needed for organic jitter in header values.
 
 // Client is an HTTP client with connection pooling and fingerprint spoofing
-// By default, it tries HTTP/3 first, then HTTP/2, then HTTP/1.1 as fallback
+// By default it uses HTTP/2, falling back to HTTP/1.1, and HTTP/3 once a host
+// has advertised it (or first, through a SOCKS5 or MASQUE proxy).
 type Client struct {
 	poolManager *pool.Manager
 	quicManager *pool.QUICManager
@@ -103,6 +105,9 @@ type Client struct {
 	// Track which hosts don't support HTTP/3 to avoid repeated failures
 	h3Failures   map[string]time.Time
 	h3FailuresMu sync.RWMutex
+
+	// altSvc is which hosts have advertised HTTP/3; see shouldTryHTTP3.
+	altSvc altsvc.Cache
 
 	// Track which hosts need HTTP/1.1 (don't support HTTP/2)
 	h2Failures   map[string]time.Time
@@ -1190,6 +1195,10 @@ func (c *Client) doOnce(ctx context.Context, req *Request, redirectHistory []*Re
 		}
 	}
 
+	// Alt-Svc is read off every response, as Chromium does; it decides
+	// whether later requests to this host may use HTTP/3.
+	c.altSvc.Learn(host, port, resp.Header.Values("Alt-Svc"), time.Now())
+
 	defer resp.Body.Close()
 
 	// Build response headers map (multi-value support)
@@ -1425,8 +1434,21 @@ func isRedirect(statusCode int) bool {
 // shouldTryHTTP3 checks if we should try HTTP/3 for this host
 func (c *Client) shouldTryHTTP3(hostKey string) bool {
 	// If no HTTP/3 transport is available, don't try HTTP/3
-	if q, m, s5 := c.h3Transports(); q == nil && m == nil && s5 == nil {
+	q, m, s5 := c.h3Transports()
+	if q == nil && m == nil && s5 == nil {
 		return false
+	}
+
+	// A direct connection goes to QUIC only for a host that has advertised
+	// HTTP/3 in an Alt-Svc header, which is the only way Chrome ever does.
+	// Trying it first, as the stream path did, opened QUIC connections to
+	// hosts that never offered it. A SOCKS5 or MASQUE proxy keeps its
+	// preference for HTTP/3: a MASQUE proxy may have no TCP path at all.
+	if m == nil && s5 == nil {
+		host, port, err := net.SplitHostPort(hostKey)
+		if err != nil || !c.altSvc.AdvertisesH3(host, port, time.Now()) {
+			return false
+		}
 	}
 
 	c.h3FailuresMu.RLock()

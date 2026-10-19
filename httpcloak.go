@@ -369,6 +369,16 @@ type Response struct {
 	Protocol string
 	History  []*RedirectInfo
 
+	// RequestHeaders is the header list the request went out with when it was
+	// sent with ExactHeaders, the Cookie slot as the session filled it. Nil for
+	// a request built from Headers.
+	RequestHeaders []fingerprint.HeaderPair
+
+	// EncodedBodyLen is the body's length as it arrived, before its
+	// Content-Encoding was removed. Timing is the request's phases in ms.
+	EncodedBodyLen int
+	Timing         *protocol.Timing
+
 	// bodyBytes caches the body after reading
 	bodyBytes []byte
 	bodyRead  bool
@@ -1219,6 +1229,10 @@ func toResponse(resp *transport.Response) *Response {
 		FinalURL:    resp.FinalURL,
 		Protocol:    resp.Protocol,
 		History:     history,
+
+		RequestHeaders: resp.RequestHeaders,
+		EncodedBodyLen: resp.EncodedBodyLen,
+		Timing:         resp.Timing,
 	}
 }
 

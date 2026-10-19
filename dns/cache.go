@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -511,8 +513,12 @@ func (c *Cache) StartCleanup(ctx context.Context, interval time.Duration) {
 // ECHEntry represents a cached ECH config entry. A negative entry has
 // ConfigList == nil and records "this host advertises no ECH" for its TTL, so we
 // don't re-fire public-DNS HTTPS queries on every H3 dial to a non-ECH host.
+//
+// It caches the whole answer to the HTTPS query rather than only the ECH part,
+// so H3 records whether the same record set advertised HTTP/3.
 type ECHEntry struct {
 	ConfigList []byte
+	H3         bool
 	ExpiresAt  time.Time
 }
 
@@ -634,6 +640,32 @@ func GetECHDNSServers() []string {
 // FetchECHConfigs fetches ECH configs from DNS HTTPS records for the given hostname.
 // Returns nil if no ECH configs are available (this is not an error).
 func FetchECHConfigs(ctx context.Context, hostname string) ([]byte, error) {
+	if e := lookupHTTPSRecord(ctx, hostname); e != nil {
+		return e.ConfigList, nil
+	}
+	return nil, nil // No ECH available is not an error
+}
+
+// AdvertisesH3 reports whether hostname's DNS HTTPS record offers h3 in its
+// alpn list, which besides Alt-Svc is how Chrome learns that a server speaks
+// HTTP/3 before its first request: HttpNetworkSession::Params'
+// use_dns_https_svcb_alpn defaults to true, and the job controller only starts
+// a DNS_ALPN_H3 job, rather than any QUIC attempt, when the record says so.
+//
+// Only a service record for the name itself counts, with no port parameter,
+// since the QUIC dial goes to this host's own addresses and port. A failed
+// lookup is a no, the same as a record that does not mention h3.
+//
+// It shares the cache and the query with FetchECHConfigs: one HTTPS lookup
+// answers both.
+func AdvertisesH3(ctx context.Context, hostname string) bool {
+	e := lookupHTTPSRecord(ctx, hostname)
+	return e != nil && e.H3
+}
+
+// lookupHTTPSRecord returns the cached answer to hostname's HTTPS query,
+// querying DNS on a miss, or nil when there is no usable answer.
+func lookupHTTPSRecord(ctx context.Context, hostname string) *ECHEntry {
 	// Check cache first. A fresh entry may be POSITIVE (has an ECH config) or
 	// NEGATIVE (ConfigList == nil, meaning "this host has no ECH"). Both short-
 	// circuit here, so a no-ECH host is not re-queried on every dial.
@@ -642,7 +674,7 @@ func FetchECHConfigs(ctx context.Context, hostname string) ([]byte, error) {
 	echCacheMu.RUnlock()
 
 	if exists && time.Now().Before(entry.ExpiresAt) {
-		return entry.ConfigList, nil
+		return entry
 	}
 
 	// Collapse concurrent dials to the same host into one DNS query — the others
@@ -655,10 +687,10 @@ func FetchECHConfigs(ctx context.Context, hostname string) ([]byte, error) {
 		e, ok := echCache[hostname]
 		echCacheMu.RUnlock()
 		if ok && time.Now().Before(e.ExpiresAt) {
-			return e.ConfigList, nil
+			return e, nil
 		}
 
-		echConfigList, ttl, qerr := queryECHFromDNS(ctx, hostname)
+		fresh, qerr := queryHTTPSRecord(ctx, hostname)
 		if qerr != nil {
 			// On DNS failure (including all-servers-SERVFAIL, now surfaced as an
 			// error rather than a bogus success) serve the expired config only
@@ -667,30 +699,25 @@ func FetchECHConfigs(ctx context.Context, hostname string) ([]byte, error) {
 			// server then rejects with illegal_parameter on every handshake until
 			// the process restarts.
 			if ok && time.Now().Before(e.ExpiresAt.Add(echStaleGrace)) {
-				return e.ConfigList, nil
+				return e, nil
 			}
 			return nil, qerr
 		}
 
 		// Cache the result — INCLUDING a nil config as a negative entry, so a host
 		// that advertises no ECH is remembered for its TTL instead of re-queried.
-		echStore(hostname, &ECHEntry{
-			ConfigList: echConfigList,
-			ExpiresAt:  time.Now().Add(time.Duration(ttl) * time.Second),
-		})
-		return echConfigList, nil
+		echStore(hostname, fresh)
+		return fresh, nil
 	})
-	if err != nil {
-		return nil, nil // No ECH available is not an error
+	if err != nil || v == nil {
+		return nil
 	}
-	if v == nil {
-		return nil, nil
-	}
-	return v.([]byte), nil
+	return v.(*ECHEntry)
 }
 
-// queryECHFromDNS queries HTTPS records and extracts ECH config
-func queryECHFromDNS(ctx context.Context, hostname string) ([]byte, uint32, error) {
+// queryHTTPSRecord queries hostname's HTTPS records and returns what the cache
+// keeps from them: the first ECH config, and whether h3 is offered.
+func queryHTTPSRecord(ctx context.Context, hostname string) (*ECHEntry, error) {
 	// Create DNS client with short timeout - ECH is optional, shouldn't block connections
 	client := &dns.Client{
 		Timeout: 500 * time.Millisecond, // Short timeout - ECH is optional
@@ -720,26 +747,41 @@ func queryECHFromDNS(ctx context.Context, hostname string) ([]byte, uint32, erro
 			continue
 		}
 
-		// Parse HTTPS records for ECH config
+		// A response without ECH is still a successful answer, cached for 300s.
+		entry := &ECHEntry{}
+		ttl := uint32(300)
 		for _, answer := range resp.Answer {
-			if https, ok := answer.(*dns.HTTPS); ok {
-				for _, kv := range https.Value {
-					if kv.Key() == dns.SVCB_ECHCONFIG {
-						// ECH config is base64 encoded in the SVCB record
-						echParam, ok := kv.(*dns.SVCBECHConfig)
-						if ok && len(echParam.ECH) > 0 {
-							return echParam.ECH, https.Hdr.Ttl, nil
-						}
+			https, ok := answer.(*dns.HTTPS)
+			if !ok {
+				continue
+			}
+			var h3, otherPort bool
+			for _, kv := range https.Value {
+				switch p := kv.(type) {
+				case *dns.SVCBECHConfig:
+					// ECH config is base64 encoded in the SVCB record
+					if entry.ConfigList == nil && len(p.ECH) > 0 {
+						entry.ConfigList = p.ECH
+						ttl = https.Hdr.Ttl
 					}
+				case *dns.SVCBAlpn:
+					h3 = h3 || slices.Contains(p.Alpn, "h3")
+				case *dns.SVCBPort:
+					otherPort = true
 				}
 			}
+			// Priority 0 is AliasMode, which carries no parameters, and a
+			// service at another name or port is not where the dial goes.
+			sameName := https.Target == "." || strings.EqualFold(strings.TrimSuffix(https.Target, "."), hostname)
+			if h3 && https.Priority > 0 && sameName && !otherPort {
+				entry.H3 = true
+			}
 		}
-
-		// No ECH found in this response, but query succeeded
-		return nil, 300, nil
+		entry.ExpiresAt = time.Now().Add(time.Duration(ttl) * time.Second)
+		return entry, nil
 	}
 
-	return nil, 0, lastErr
+	return nil, lastErr
 }
 
 // FetchECHConfigsBase64 returns ECH configs as base64 string (for debugging)

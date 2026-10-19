@@ -3,6 +3,7 @@ package transport
 import (
 	"context"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 )
@@ -114,6 +115,32 @@ func TestNoRetryOnInternalError(t *testing.T) {
 	}
 	if n := s.connCount(); n != 1 {
 		t.Fatalf("server saw %d connections, want 1\n%s", n, s.dump())
+	}
+}
+
+// In auto mode a stream the server resets is not sent again on a new HTTP/1.1
+// connection, and the caller gets the reset itself. The fallback used to turn
+// an anti-bot RST_STREAM(INTERNAL_ERROR) into the HTTP/1.1 attempt's timeout.
+func TestAutoKeepsTheStreamResetOffHTTP1(t *testing.T) {
+	s := startH2Server(t, h2Config{
+		ResetStreams: map[int]uint32{1: errCodeInternal},
+	})
+
+	tr := NewTransport("chrome-latest")
+	tr.SetInsecureSkipVerify(true)
+	t.Cleanup(tr.Close)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	_, err := tr.Do(ctx, &Request{Method: "GET", URL: s.url("/reset")})
+	if err == nil || !strings.Contains(err.Error(), "INTERNAL_ERROR") {
+		t.Fatalf("got %v, want the stream reset with INTERNAL_ERROR\n%s", err, s.dump())
+	}
+	time.Sleep(100 * time.Millisecond)
+
+	if n := s.connCount(); n != 1 {
+		t.Fatalf("server saw %d connections, want 1: the request went out again on "+
+			"a new connection\n%s", n, s.dump())
 	}
 }
 

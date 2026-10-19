@@ -402,6 +402,10 @@ func (s *Session) requestWithRedirects(ctx context.Context, req *transport.Reque
 		origCookie = c[0]
 	}
 
+	// The caller's list, kept unfilled: each attempt fills the Cookie slot from it and a
+	// redirect hop takes it so the hop fills its own.
+	exactHeaders := req.ExactHeaders
+
 	// A one-shot streaming body cannot go on the wire twice. Unlike a redirect,
 	// a retry is optional — we already hold a response or a real error — so a
 	// non-replayable body disables the retry rather than corrupting it or
@@ -413,8 +417,9 @@ func (s *Session) requestWithRedirects(ctx context.Context, req *transport.Reque
 		// Build Cookie header fresh each attempt from original + session cookies.
 		// Skip the jar lookup entirely when WithoutCookieJar — caller-provided
 		// Cookie headers still pass through unchanged.
+		var sessionCookies string
 		if !s.Config.WithoutCookieJar {
-			sessionCookies := s.cookies.BuildCookieHeader(requestHost, requestPath, requestSecure)
+			sessionCookies = s.cookies.BuildCookieHeader(requestHost, requestPath, requestSecure)
 			if sessionCookies != "" {
 				if origCookie != "" {
 					req.Headers["Cookie"] = []string{origCookie + "; " + sessionCookies}
@@ -425,6 +430,7 @@ func (s *Session) requestWithRedirects(ctx context.Context, req *transport.Reque
 				req.Headers["Cookie"] = []string{origCookie}
 			}
 		}
+		req.ExactHeaders = fillExactCookie(exactHeaders, sessionCookies)
 
 		// Resolve client-hint policy (opt-outs + high-entropy injection). This
 		// also marks req for the transport to strip the preset trio on a full
@@ -443,6 +449,9 @@ func (s *Session) requestWithRedirects(ctx context.Context, req *transport.Reque
 		}
 
 		resp, err = s.transport.Do(ctx, req)
+		if resp != nil {
+			resp.RequestHeaders = req.ExactHeaders
+		}
 
 		// If no error and no retry config, or this is the last attempt, break
 		if maxRetries == 0 {
@@ -643,7 +652,7 @@ func (s *Session) requestWithRedirects(ctx context.Context, req *transport.Reque
 				// request and the full preset pipeline on every hop after it,
 				// silently. Referer is the one thing the redirect path may still
 				// add on top, and DisableRedirectReferer turns that off.
-				ExactHeaders: req.ExactHeaders,
+				ExactHeaders: exactHeaders,
 			}
 
 			// Copy safe headers
@@ -1717,6 +1726,24 @@ func trim(s string) string {
 	return s[start:end]
 }
 
+// fillExactCookie gives an empty Cookie pair the jar's header for this request, or drops the
+// pair when the jar has nothing to send. A pair that carries a value is the caller's and
+// stays as it is. The caller's slice is never written to.
+func fillExactCookie(exact []fingerprint.HeaderPair, jarCookies string) []fingerprint.HeaderPair {
+	for i, hp := range exact {
+		if hp.Value != "" || !strings.EqualFold(hp.Key, "cookie") {
+			continue
+		}
+		filled := make([]fingerprint.HeaderPair, 0, len(exact))
+		filled = append(filled, exact[:i]...)
+		if jarCookies != "" {
+			filled = append(filled, fingerprint.HeaderPair{Key: hp.Key, Value: jarCookies})
+		}
+		return append(filled, exact[i+1:]...)
+	}
+	return exact
+}
+
 func splitCookies(s string) []string {
 	var result []string
 	var current string
@@ -1781,11 +1808,12 @@ func (s *Session) RequestStream(ctx context.Context, req *transport.Request) (*S
 
 	// Add session cookies to request headers using proper domain/path matching.
 	// Skip when WithoutCookieJar — caller-provided Cookie headers still pass through.
+	var sessionCookies string
 	if !s.Config.WithoutCookieJar {
 		requestHost := extractHost(req.URL)
 		requestPath := extractPath(req.URL)
 		requestSecure := isSecureURL(req.URL)
-		sessionCookies := s.cookies.BuildCookieHeader(requestHost, requestPath, requestSecure)
+		sessionCookies = s.cookies.BuildCookieHeader(requestHost, requestPath, requestSecure)
 		if sessionCookies != "" {
 			existingCookies := req.Headers["Cookie"]
 			if len(existingCookies) > 0 && existingCookies[0] != "" {
@@ -1795,6 +1823,7 @@ func (s *Session) RequestStream(ctx context.Context, req *transport.Request) (*S
 			}
 		}
 	}
+	req.ExactHeaders = fillExactCookie(req.ExactHeaders, sessionCookies)
 	s.mu.Unlock()
 
 	// Resolve client-hint policy for parity with the buffered path: emit coherent

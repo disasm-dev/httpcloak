@@ -665,6 +665,10 @@ func (p *HostPool) createConn(ctx context.Context) (*Conn, error) {
 		PreferSkipResumptionOnNilExtension: true,          // Safety net: skip resumption if spec lacks PSK extension
 		EncryptedClientHelloConfigList:     echConfigList, // ECH configuration (if available)
 		KeyLogWriter:                       keyLogWriter,
+		TicketAgeWholeSeconds:              p.preset.TLSTicketAgeWholeSeconds(),
+		OmitCloseNotify:                    p.preset.TLSOmitCloseNotify(),
+		DeferKeyUpdateReply:                p.preset.TLSDeferKeyUpdateReply(),
+		FalseStart:                         p.preset.TLSFalseStart(),
 	}
 	p.tlsVerify.Apply(tlsConfig)
 

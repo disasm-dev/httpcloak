@@ -1,11 +1,15 @@
 package transport
 
 import (
+	"bufio"
 	"bytes"
 	"fmt"
 	"io"
+	"strings"
 	"sync"
 	"testing"
+
+	http "github.com/sardanioss/http"
 )
 
 // Regression tests for the response-body buffer aliasing bug.
@@ -114,20 +118,30 @@ func TestReadBodyConcurrentIntegrity(t *testing.T) {
 	}
 }
 
-// A short read (server closed early) must still return only the bytes actually
-// received, and still own its buffer.
-func TestReadBodyShortReadOwnsBuffer(t *testing.T) {
-	const declared = 4 * 1024 * 1024
-	actual := bytes.Repeat([]byte{'z'}, 1024)
+// A body cut off before its declared length fails, whether some of it arrived or none.
+func TestReadBodyCutOffFails(t *testing.T) {
+	for _, sent := range []string{"", `{"stores":`} {
+		raw := "HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: 100\r\n\r\n" + sent
+		resp, err := http.ReadResponse(bufio.NewReader(strings.NewReader(raw)), nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := readBodyOptimized(resp.Body, resp.ContentLength); err != io.ErrUnexpectedEOF {
+			t.Errorf("%d of 100 bytes sent: err = %v, want io.ErrUnexpectedEOF", len(sent), err)
+		}
+	}
+}
 
-	body, err := readBodyOptimized(io.LimitReader(bytes.NewReader(actual), int64(len(actual))), declared)
+// A HEAD answer declares a length and sends nothing, which is not a cut-off.
+func TestReadBodyHeadIsEmpty(t *testing.T) {
+	req, _ := http.NewRequest(http.MethodHead, "https://example.com/", nil)
+	raw := "HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n"
+	resp, err := http.ReadResponse(bufio.NewReader(strings.NewReader(raw)), req)
 	if err != nil {
-		t.Fatalf("readBodyOptimized: %v", err)
+		t.Fatal(err)
 	}
-	if len(body) != len(actual) {
-		t.Fatalf("len(body) = %d, want %d", len(body), len(actual))
-	}
-	if !bytes.Equal(body, actual) {
-		t.Fatal("short-read body contents differ from what was sent")
+	body, err := readBodyOptimized(resp.Body, resp.ContentLength)
+	if err != nil || len(body) != 0 {
+		t.Fatalf("got %d bytes, %v; want an empty body and no error", len(body), err)
 	}
 }

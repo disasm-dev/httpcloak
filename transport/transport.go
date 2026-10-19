@@ -20,6 +20,7 @@ import (
 	"github.com/klauspost/compress/zstd"
 	"github.com/sardanioss/httpcloak/dns"
 	"github.com/sardanioss/httpcloak/fingerprint"
+	"github.com/sardanioss/httpcloak/internal/altsvc"
 	"github.com/sardanioss/httpcloak/protocol"
 )
 
@@ -27,7 +28,9 @@ import (
 type Protocol int
 
 const (
-	// ProtocolAuto automatically selects the best protocol (H3 -> H2 -> H1)
+	// ProtocolAuto selects the protocol the way Chrome does: H2 (or H1) over
+	// TCP, with H3 raced against it only for a host that has advertised HTTP/3
+	// through Alt-Svc or its DNS HTTPS record.
 	ProtocolAuto Protocol = iota
 	// ProtocolHTTP1 forces HTTP/1.1 over TCP
 	ProtocolHTTP1
@@ -214,6 +217,10 @@ type Request struct {
 	// Sec-Fetch inference, no alphabetical tail for names the preset does not
 	// know, and no merge of the Headers map, which is where the session writes
 	// its cookie jar.
+	//
+	// The one slot the session fills is a Cookie pair left empty: it takes the
+	// jar's header for the URL in that position, and is dropped when the jar has
+	// nothing to send. A Cookie pair that carries a value goes out as given.
 	//
 	// A name may repeat, and each occurrence keeps its own position rather than
 	// collapsing onto the first. Every encoder reads the order list as one slot
@@ -471,6 +478,15 @@ type Response struct {
 	Protocol string // "h1", "h2", or "h3"
 	History  []*RedirectInfo
 
+	// RequestHeaders is the header list the request went out with when it was
+	// sent with ExactHeaders, the Cookie slot as the session filled it. Nil for
+	// a request built from Headers.
+	RequestHeaders []fingerprint.HeaderPair
+
+	// EncodedBodyLen is the body's length as it arrived, before its
+	// Content-Encoding was removed.
+	EncodedBodyLen int
+
 	// bodyBytes caches the body after reading for multiple access
 	bodyBytes []byte
 	bodyRead  bool
@@ -612,6 +628,12 @@ type Transport struct {
 	// Track protocol support per host
 	protocolSupport   map[string]Protocol // Best known protocol per host
 	protocolSupportMu sync.RWMutex
+
+	// altSvc is what servers have advertised about HTTP/3, and h3up brings a
+	// TCP host up to HTTP/3 once it has. Auto mode opens no QUIC connection a
+	// server has not asked for; see altsvc.go.
+	altSvc altsvc.Cache
+	h3up   h3Upgrader
 
 	// Configuration
 	insecureSkipVerify bool
@@ -1382,6 +1404,14 @@ func (t *Transport) getPreset() *fingerprint.Preset {
 
 // Do executes an HTTP request
 func (t *Transport) Do(ctx context.Context, req *Request) (*Response, error) {
+	resp, err := t.do(ctx, req)
+	if err == nil && resp != nil {
+		t.learnAltSvc(req.URL, resp.Headers)
+	}
+	return resp, err
+}
+
+func (t *Transport) do(ctx context.Context, req *Request) (*Response, error) {
 	// Parse URL to determine scheme
 	parsedURL, err := url.Parse(req.URL)
 	if err != nil {
@@ -1476,6 +1506,9 @@ func (t *Transport) Do(ctx context.Context, req *Request) (*Response, error) {
 				if errors.As(err, &alpnErr) {
 					return t.doHTTP1WithTLSConn(ctx, req, alpnErr)
 				}
+				if isHTTP2StreamError(err) {
+					return nil, err
+				}
 				return t.doHTTP1(ctx, req)
 			}
 
@@ -1506,6 +1539,9 @@ func (t *Transport) Do(ctx context.Context, req *Request) (*Response, error) {
 			if errors.As(err, &alpnErr) {
 				return t.doHTTP1WithTLSConn(ctx, req, alpnErr)
 			}
+			if isHTTP2StreamError(err) {
+				return nil, err
+			}
 			return t.doHTTP1(ctx, req)
 
 		default:
@@ -1533,6 +1569,11 @@ func (t *Transport) Do(ctx context.Context, req *Request) (*Response, error) {
 // doAuto races HTTP/3 and HTTP/2 in parallel, using whichever succeeds first.
 // This avoids the 5-second HTTP/3 timeout delay when QUIC is blocked.
 // When ALPN negotiates HTTP/1.1 instead of HTTP/2, the TLS connection is reused.
+//
+// The HTTP/3 side of the race only dials a host that has advertised HTTP/3
+// (see h3Advertised); for any other host it bows out at once and TCP wins. A
+// host settled on TCP that later sends Alt-Svc for h3 is brought up to HTTP/3
+// in the background (see maybeUpgradeToH3).
 func (t *Transport) doAuto(ctx context.Context, req *Request) (*Response, error) {
 	host := extractHost(req.URL)
 
@@ -1545,6 +1586,9 @@ func (t *Transport) doAuto(ctx context.Context, req *Request) (*Response, error)
 	t.protocolSupportMu.RUnlock()
 
 	if known {
+		if knownProtocol != ProtocolHTTP3 {
+			t.maybeUpgradeToH3(snap, req.URL)
+		}
 		switch knownProtocol {
 		case ProtocolHTTP3:
 			return t.doHTTP3(ctx, req)
@@ -1557,6 +1601,9 @@ func (t *Transport) doAuto(ctx context.Context, req *Request) (*Response, error)
 			var alpnErr *ALPNMismatchError
 			if errors.As(err, &alpnErr) {
 				return t.doHTTP1WithTLSConn(ctx, req, alpnErr)
+			}
+			if isHTTP2StreamError(err) {
+				return nil, err
 			}
 			// H2 failed for other reason, try H1 with new connection
 			return t.doHTTP1(ctx, req)
@@ -1602,6 +1649,9 @@ func (t *Transport) doAuto(ctx context.Context, req *Request) (*Response, error)
 			}
 			return resp, err
 		}
+		if isHTTP2StreamError(err) {
+			return nil, err
+		}
 		// Both failed, try HTTP/1.1 with new connection
 	} else {
 		// No H3 support, just try H2
@@ -1622,6 +1672,9 @@ func (t *Transport) doAuto(ctx context.Context, req *Request) (*Response, error)
 				t.protocolSupportMu.Unlock()
 			}
 			return resp, err
+		}
+		if isHTTP2StreamError(err) {
+			return nil, err
 		}
 	}
 
@@ -1684,7 +1737,14 @@ func (t *Transport) raceConnectProtocol(ctx context.Context, host, port string) 
 	// race the pointer reads inside the probe closures.
 	snap := t.snapshot()
 	return raceTwoProbes(ctx, 6*time.Second,
-		func(c context.Context) error { return snap.h3.Connect(c, host, port) },
+		func(c context.Context) error {
+			// No QUIC for a host that has not offered HTTP/3. The TCP probe is
+			// already running, so a DNS lookup here costs the race nothing.
+			if !t.h3Advertised(c, snap, host, port) {
+				return errH3NotAdvertised
+			}
+			return snap.h3.Connect(c, host, port)
+		},
 		func(c context.Context) error { return snap.h2.Connect(c, host, port) },
 	)
 }
@@ -1886,6 +1946,9 @@ func (t *Transport) raceH3H2(ctx context.Context, req *Request) (*Response, Prot
 				resp, err := t.doHTTP1WithTLSConn(ctx, req, alpnErr)
 				return resp, ProtocolHTTP1, err
 			}
+			if isHTTP2StreamError(err) {
+				return nil, ProtocolHTTP2, err
+			}
 			// H2 failed for other reason, try H1 with new connection. This is
 			// a fallback, not a negotiation: it says nothing about what the
 			// host speaks, so report ProtocolAuto and let doAuto leave the host
@@ -1980,13 +2043,15 @@ func (t *Transport) doHTTP1(ctx context.Context, req *Request) (*Response, error
 	}
 	defer resp.Body.Close()
 
-	timing.FirstByte = float64(time.Since(reqStart).Milliseconds())
+	timing.FirstByte = float64(time.Since(reqStart).Microseconds()) / 1000
 
 	// Read response body with pre-allocation for known content length
 	body, err := readBodyOptimized(resp.Body, resp.ContentLength)
 	if err != nil {
 		return nil, NewRequestError("read_body", host, port, "h1", err)
 	}
+
+	encodedBodyLen := len(body)
 
 	// Decompress if needed
 	contentEncoding := resp.Header.Get("Content-Encoding")
@@ -1998,7 +2063,7 @@ func (t *Transport) doHTTP1(ctx context.Context, req *Request) (*Response, error
 		body = decompressed
 	}
 
-	timing.Total = float64(time.Since(startTime).Milliseconds())
+	timing.Total = float64(time.Since(startTime).Microseconds()) / 1000
 
 	// Build response headers map
 	headers := buildHeadersMap(resp.Header)
@@ -2015,6 +2080,8 @@ func (t *Transport) doHTTP1(ctx context.Context, req *Request) (*Response, error
 		Protocol:     "h1",
 		bodyBytes:    body,
 		bodyRead:     true,
+
+		EncodedBodyLen: encodedBodyLen,
 	}, nil
 }
 
@@ -2085,13 +2152,15 @@ func (t *Transport) doHTTP1WithTLSConn(ctx context.Context, req *Request, alpnEr
 	}
 	defer resp.Body.Close()
 
-	timing.FirstByte = float64(time.Since(reqStart).Milliseconds())
+	timing.FirstByte = float64(time.Since(reqStart).Microseconds()) / 1000
 
 	// Read response body with pre-allocation for known content length
 	body, err := readBodyOptimized(resp.Body, resp.ContentLength)
 	if err != nil {
 		return nil, NewRequestError("read_body", host, port, "h1", err)
 	}
+
+	encodedBodyLen := len(body)
 
 	// Decompress if needed
 	contentEncoding := resp.Header.Get("Content-Encoding")
@@ -2103,7 +2172,7 @@ func (t *Transport) doHTTP1WithTLSConn(ctx context.Context, req *Request, alpnEr
 		body = decompressed
 	}
 
-	timing.Total = float64(time.Since(startTime).Milliseconds())
+	timing.Total = float64(time.Since(startTime).Microseconds()) / 1000
 
 	// Build response headers map
 	headers := buildHeadersMap(resp.Header)
@@ -2120,6 +2189,8 @@ func (t *Transport) doHTTP1WithTLSConn(ctx context.Context, req *Request, alpnEr
 		Protocol:     "h1",
 		bodyBytes:    body,
 		bodyRead:     true,
+
+		EncodedBodyLen: encodedBodyLen,
 	}, nil
 }
 
@@ -2197,13 +2268,15 @@ func (t *Transport) doHTTP2(ctx context.Context, req *Request) (*Response, error
 	}
 	defer resp.Body.Close()
 
-	timing.FirstByte = float64(time.Since(reqStart).Milliseconds())
+	timing.FirstByte = float64(time.Since(reqStart).Microseconds()) / 1000
 
 	// Read response body with pre-allocation for known content length
 	body, err := readBodyOptimized(resp.Body, resp.ContentLength)
 	if err != nil {
 		return nil, NewRequestError("read_body", host, port, "h2", err)
 	}
+
+	encodedBodyLen := len(body)
 
 	// Decompress if needed
 	contentEncoding := resp.Header.Get("Content-Encoding")
@@ -2215,7 +2288,7 @@ func (t *Transport) doHTTP2(ctx context.Context, req *Request) (*Response, error
 		body = decompressed
 	}
 
-	timing.Total = float64(time.Since(startTime).Milliseconds())
+	timing.Total = float64(time.Since(startTime).Microseconds()) / 1000
 
 	// Timing breakdown, measured at connection setup.
 	//
@@ -2251,6 +2324,8 @@ func (t *Transport) doHTTP2(ctx context.Context, req *Request) (*Response, error
 		Protocol:     "h2",
 		bodyBytes:    body,
 		bodyRead:     true,
+
+		EncodedBodyLen: encodedBodyLen,
 	}, nil
 }
 
@@ -2337,13 +2412,15 @@ func (t *Transport) doHTTP3(ctx context.Context, req *Request) (*Response, error
 	defer cleanup()
 	defer resp.Body.Close()
 
-	timing.FirstByte = float64(time.Since(reqStart).Milliseconds())
+	timing.FirstByte = float64(time.Since(reqStart).Microseconds()) / 1000
 
 	// Read response body with pre-allocation for known content length
 	body, err := readBodyOptimized(resp.Body, resp.ContentLength)
 	if err != nil {
 		return nil, NewRequestError("read_body", host, port, "h3", err)
 	}
+
+	encodedBodyLen := len(body)
 
 	// Decompress if needed
 	contentEncoding := resp.Header.Get("Content-Encoding")
@@ -2355,7 +2432,7 @@ func (t *Transport) doHTTP3(ctx context.Context, req *Request) (*Response, error
 		body = decompressed
 	}
 
-	timing.Total = float64(time.Since(startTime).Milliseconds())
+	timing.Total = float64(time.Since(startTime).Microseconds()) / 1000
 
 	// Timing breakdown for HTTP/3.
 	//
@@ -2388,6 +2465,8 @@ func (t *Transport) doHTTP3(ctx context.Context, req *Request) (*Response, error
 		Protocol:     "h3",
 		bodyBytes:    body,
 		bodyRead:     true,
+
+		EncodedBodyLen: encodedBodyLen,
 	}, nil
 }
 
@@ -2491,6 +2570,7 @@ func isH3Stall(err error) bool {
 
 // Close shuts down the transport
 func (t *Transport) Close() {
+	t.h3up.stop()
 	t.h1Transport.Close()
 	t.h2Transport.Close()
 	t.h3Transport.Close()
@@ -2508,6 +2588,7 @@ func (t *Transport) Close() {
 // connections are closed immediately, as by Close: the QUIC layer has no
 // per-request drain.
 func (t *Transport) CloseGraceful() {
+	t.h3up.stop()
 	t.h1Transport.Close()
 	t.h2Transport.CloseGraceful()
 	t.h3Transport.Close()
@@ -3159,8 +3240,13 @@ func readBodyOptimized(body io.Reader, contentLength int64) ([]byte, error) {
 	if contentLength > 0 {
 		buf := make([]byte, contentLength)
 		n, err := io.ReadFull(body, buf)
-		if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
+		// io.EOF is no body at all, which is a HEAD answer: it declares a length it never sends.
+		// Anything else short of the declared length is a cut-off body and fails, as in Chrome.
+		if err != nil && err != io.EOF {
 			return nil, err
+		}
+		if err == nil {
+			awaitBodyEnd(body)
 		}
 		return buf[:n], nil
 	}
@@ -3197,7 +3283,36 @@ func readBodyOptimized(body io.Reader, contentLength int64) ([]byte, error) {
 	return result, nil
 }
 
+// awaitBodyEnd reads on past a body's declared length until the body ends.
+//
+// Content-Length says how many bytes are coming, not that the stream is over.
+// Chromium treats an HTTP/2 body as complete only once the stream has closed
+// (SpdyHttpStream::IsResponseBodyComplete is stream_closed_), so it waits for
+// END_STREAM even with every declared byte in hand, and likewise for the FIN
+// on HTTP/3. Stopping at the declared length and closing the body made the
+// transport cancel a stream the server was about to end, an RST_STREAM(CANCEL)
+// on a complete response that Chrome never sends. An HTTP/1.1 body is already
+// cut at Content-Length, so there this returns straight away.
+//
+// Nothing is expected here. Data past the declared length is a protocol error
+// that the HTTP/2 transport rejects itself, and an error only ends the wait:
+// the body the caller gets is already complete.
+func awaitBodyEnd(body io.Reader) {
+	var scratch [512]byte
+	for {
+		if _, err := body.Read(scratch[:]); err != nil {
+			return
+		}
+	}
+}
+
 func decompress(data []byte, encoding string) ([]byte, error) {
+	// A body-less answer (a 204 is the usual one) keeps its Content-Encoding. gzip.NewReader on nothing is
+	// io.EOF, which failed a request the server had already answered and sent Auto mode to replay it on H1.
+	if len(data) == 0 {
+		return data, nil
+	}
+
 	switch strings.ToLower(encoding) {
 	case "gzip":
 		reader, err := gzip.NewReader(bytes.NewReader(data))

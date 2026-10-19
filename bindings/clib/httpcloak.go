@@ -1,10 +1,18 @@
 package main
 
 /*
+// hop_windows.c takes over crosscall2 so no export runs Go code on the caller's thread.
+#cgo windows LDFLAGS: -Wl,--wrap=crosscall2
+
 #include <stdlib.h>
 #include <stdint.h>
 
 typedef void (*async_callback)(int64_t callback_id, const char* response_json, const char* error);
+
+// One per process, set with httpcloak_set_raw_callback. Every httpcloak_request_raw_async completes
+// here: meta_json describes the response without its body and body holds the body's bytes, or
+// meta_json is NULL and error says what failed. All three buffers are freed once it returns.
+typedef void (*raw_callback)(int64_t request_id, const char* meta_json, const void* body, int32_t body_len, const char* error);
 
 // Session cache callbacks - called by Go to get/put TLS sessions from external cache
 // SYNC mode: returns result immediately
@@ -32,6 +40,147 @@ static void invoke_callback(async_callback cb, int64_t callback_id, const char* 
     if (cb != NULL) {
         cb(callback_id, response_json, error);
     }
+}
+
+// Async completions are delivered from a thread this file owns rather than from the
+// goroutine that ran the request. A host runtime adopts whatever thread its code runs on,
+// and a Go thread cannot take the special user APC such a runtime may later send it:
+// on a goroutine stack NtContinueEx refuses the resume with 0xC000000D (see hop_windows.c),
+// which is non-continuable, so the process dies with no exception and no dump.
+typedef struct cb_item {
+    async_callback cb;
+    raw_callback rcb;
+    int64_t id;
+    char* resp;      // async_callback: the response json; raw_callback: the meta json
+    void* body;
+    int32_t body_len;
+    char* err;
+    struct cb_item* next;
+} cb_item;
+
+static cb_item* cb_head = NULL;
+static cb_item* cb_tail = NULL;
+
+#ifdef _WIN32
+#include <windows.h>
+static CRITICAL_SECTION cb_lock;
+static CONDITION_VARIABLE cb_ready;
+#define CB_LOCK()   EnterCriticalSection(&cb_lock)
+#define CB_UNLOCK() LeaveCriticalSection(&cb_lock)
+#define CB_WAIT()   SleepConditionVariableCS(&cb_ready, &cb_lock, INFINITE)
+#define CB_WAKE()   WakeConditionVariable(&cb_ready)
+#else
+#include <pthread.h>
+static pthread_mutex_t cb_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t cb_ready = PTHREAD_COND_INITIALIZER;
+#define CB_LOCK()   pthread_mutex_lock(&cb_lock)
+#define CB_UNLOCK() pthread_mutex_unlock(&cb_lock)
+#define CB_WAIT()   pthread_cond_wait(&cb_ready, &cb_lock)
+#define CB_WAKE()   pthread_cond_signal(&cb_ready)
+#endif
+
+static void cb_deliver(void) {
+    for (;;) {
+        cb_item* it;
+        CB_LOCK();
+        while (cb_head == NULL) {
+            CB_WAIT();
+        }
+        it = cb_head;
+        cb_head = it->next;
+        if (cb_head == NULL) {
+            cb_tail = NULL;
+        }
+        CB_UNLOCK();
+
+        if (it->rcb != NULL) {
+            it->rcb(it->id, it->resp, it->body, it->body_len, it->err);
+        } else if (it->cb != NULL) {
+            it->cb(it->id, it->resp, it->err);
+        }
+        free(it->resp);
+        free(it->body);
+        free(it->err);
+        free(it);
+    }
+}
+
+#ifdef _WIN32
+static DWORD WINAPI cb_thread(LPVOID unused) {
+    (void)unused;
+    cb_deliver();
+    return 0;
+}
+
+static void cb_start(void) {
+    HANDLE t;
+    InitializeCriticalSection(&cb_lock);
+    InitializeConditionVariable(&cb_ready);
+    t = CreateThread(NULL, 0, cb_thread, NULL, 0, NULL);
+    if (t != NULL) {
+        CloseHandle(t);
+    }
+}
+#else
+static void* cb_thread(void* unused) {
+    (void)unused;
+    cb_deliver();
+    return NULL;
+}
+
+static void cb_start(void) {
+    pthread_t t;
+    if (pthread_create(&t, NULL, cb_thread, NULL) == 0) {
+        pthread_detach(t);
+    }
+}
+#endif
+
+static void cb_push(cb_item* it) {
+    CB_LOCK();
+    if (cb_tail == NULL) {
+        cb_head = it;
+    } else {
+        cb_tail->next = it;
+    }
+    cb_tail = it;
+    CB_WAKE();
+    CB_UNLOCK();
+}
+
+// Takes ownership of response_json and error; the delivering thread frees them.
+static void enqueue_callback(async_callback cb, int64_t callback_id, char* response_json, char* error) {
+    cb_item* it = (cb_item*)calloc(1, sizeof(cb_item));
+    if (it == NULL) {
+        free(response_json);
+        free(error);
+        return;
+    }
+
+    it->cb = cb;
+    it->id = callback_id;
+    it->resp = response_json;
+    it->err = error;
+    cb_push(it);
+}
+
+// Takes ownership of meta_json, body and error; the delivering thread frees them.
+static void enqueue_raw_callback(raw_callback cb, int64_t request_id, char* meta_json, void* body, int32_t body_len, char* error) {
+    cb_item* it = (cb_item*)calloc(1, sizeof(cb_item));
+    if (it == NULL) {
+        free(meta_json);
+        free(body);
+        free(error);
+        return;
+    }
+
+    it->rcb = cb;
+    it->id = request_id;
+    it->resp = meta_json;
+    it->body = body;
+    it->body_len = body_len;
+    it->err = error;
+    cb_push(it);
 }
 
 // Helper functions to invoke SYNC session cache callbacks
@@ -128,6 +277,7 @@ import (
 	"github.com/sardanioss/httpcloak"
 	"github.com/sardanioss/httpcloak/dns"
 	"github.com/sardanioss/httpcloak/fingerprint"
+	"github.com/sardanioss/httpcloak/protocol"
 	"github.com/sardanioss/httpcloak/transport"
 )
 
@@ -254,6 +404,9 @@ type RequestConfig struct {
 	// Headers map cannot carry order, casing or a repeated name, which is
 	// exactly what reproducing a captured request needs. Headers is ignored
 	// when this is set.
+	//
+	// ["Cookie", ""] is a slot: the session's jar fills it in that position, or
+	// drops it when it has no cookies for the URL.
 	ExactHeaders [][]string `json:"exact_headers,omitempty"`
 
 	// HeaderOrder sets the order for this one request and overrides whatever
@@ -343,6 +496,10 @@ type ResponseData struct {
 	HeaderOrder  []string            `json:"header_order,omitempty"`
 	HeaderCasing []string            `json:"header_casing,omitempty"`
 	Trailer      map[string][]string `json:"trailer,omitempty"`
+
+	// RequestHeaders is the [name, value] list a request sent with exact_headers
+	// went out with, the Cookie slot as the session filled it. Nil otherwise.
+	RequestHeaders [][]string `json:"request_headers,omitempty"`
 }
 
 // ResponseMetadata for optimized responses - body is passed separately as raw bytes
@@ -356,9 +513,14 @@ type ResponseMetadata struct {
 	History    []RedirectInfo      `json:"history"`
 
 	// See ResponseData for what these are and when they are nil.
-	HeaderOrder  []string            `json:"header_order,omitempty"`
-	HeaderCasing []string            `json:"header_casing,omitempty"`
-	Trailer      map[string][]string `json:"trailer,omitempty"`
+	HeaderOrder    []string            `json:"header_order,omitempty"`
+	HeaderCasing   []string            `json:"header_casing,omitempty"`
+	Trailer        map[string][]string `json:"trailer,omitempty"`
+	RequestHeaders [][]string          `json:"request_headers,omitempty"`
+
+	// The body's length before its Content-Encoding was removed, and the request's phases in ms.
+	EncodedBodyLen int              `json:"encoded_body_len"`
+	Timing         *protocol.Timing `json:"timing,omitempty"`
 }
 
 // RawResponse holds response data with body as raw bytes (not JSON encoded)
@@ -757,17 +919,18 @@ func makeResponseJSON(resp *httpcloak.Response) *C.char {
 
 	body, bodyEncoding := encodeResponseBody(bodyBytes)
 	data := ResponseData{
-		StatusCode:   resp.StatusCode,
-		Headers:      resp.Headers,
-		HeaderOrder:  resp.HeaderOrder,
-		HeaderCasing: resp.HeaderCasing,
-		Trailer:      resp.Trailer,
-		Body:         body,
-		BodyEncoding: bodyEncoding,
-		FinalURL:     resp.FinalURL,
-		Protocol:     resp.Protocol,
-		Cookies:      cookies,
-		History:      history,
+		StatusCode:     resp.StatusCode,
+		Headers:        resp.Headers,
+		HeaderOrder:    resp.HeaderOrder,
+		HeaderCasing:   resp.HeaderCasing,
+		RequestHeaders: headerPairs(resp.RequestHeaders),
+		Trailer:        resp.Trailer,
+		Body:           body,
+		BodyEncoding:   bodyEncoding,
+		FinalURL:       resp.FinalURL,
+		Protocol:       resp.Protocol,
+		Cookies:        cookies,
+		History:        history,
 	}
 	jsonData, _ := json.Marshal(data)
 	return C.CString(string(jsonData))
@@ -800,16 +963,19 @@ func makeRawResponse(resp *httpcloak.Response) int64 {
 
 	// Create metadata (without body)
 	meta := ResponseMetadata{
-		StatusCode:   resp.StatusCode,
-		Headers:      resp.Headers,
-		HeaderOrder:  resp.HeaderOrder,
-		HeaderCasing: resp.HeaderCasing,
-		Trailer:      resp.Trailer,
-		BodyLen:      len(bodyBytes),
-		FinalURL:     resp.FinalURL,
-		Protocol:     resp.Protocol,
-		Cookies:      cookies,
-		History:      history,
+		StatusCode:     resp.StatusCode,
+		Headers:        resp.Headers,
+		HeaderOrder:    resp.HeaderOrder,
+		HeaderCasing:   resp.HeaderCasing,
+		RequestHeaders: headerPairs(resp.RequestHeaders),
+		Trailer:        resp.Trailer,
+		BodyLen:        len(bodyBytes),
+		EncodedBodyLen: resp.EncodedBodyLen,
+		Timing:         resp.Timing,
+		FinalURL:       resp.FinalURL,
+		Protocol:       resp.Protocol,
+		Cookies:        cookies,
+		History:        history,
 	}
 	metaJSON, _ := json.Marshal(meta)
 
@@ -1830,14 +1996,193 @@ func invokeCallback(callbackID int64, responseJSON string, errStr string) {
 		errC = C.CString(errStr)
 	}
 
-	C.invoke_callback(callback, C.int64_t(callbackID), respC, errC)
+	// Delivered from the C-owned thread, not this goroutine's: the host's callback must not
+	// run on a thread the Go runtime owns. The strings go with it and it frees them.
+	callbackThread.Do(func() { C.cb_start() })
+	C.enqueue_callback(callback, C.int64_t(callbackID), respC, errC)
+}
 
-	if respC != nil {
-		C.free(unsafe.Pointer(respC))
+var callbackThread sync.Once
+
+// ============================================================================
+// Raw asynchronous requests
+// ============================================================================
+
+// The raw path carries the body outside the JSON in both directions, so it is never base64'd,
+// JSON-escaped or scanned for UTF-8 validity. One callback serves the whole process and the
+// caller picks the request id, so a request is one export call and a cancel is one.
+var (
+	rawMu       sync.Mutex
+	rawCallback C.raw_callback
+	rawCancels  = make(map[int64]context.CancelFunc)
+)
+
+//export httpcloak_set_raw_callback
+func httpcloak_set_raw_callback(callback C.raw_callback) {
+	defer guardVoid("httpcloak_set_raw_callback")
+	rawMu.Lock()
+	rawCallback = callback
+	rawMu.Unlock()
+}
+
+//export httpcloak_cancel_raw_request
+func httpcloak_cancel_raw_request(requestID C.int64_t) {
+	defer guardVoid("httpcloak_cancel_raw_request")
+	rawMu.Lock()
+	cancel, exists := rawCancels[int64(requestID)]
+	rawMu.Unlock()
+	if exists {
+		cancel()
 	}
-	if errC != nil {
-		C.free(unsafe.Pointer(errC))
+}
+
+// deliverRaw hands one completion to the process callback: meta and body on success, errJSON
+// on failure. The C copies belong to the delivery thread, which frees them after the call.
+func deliverRaw(requestID int64, meta []byte, body []byte, errJSON string) {
+	rawMu.Lock()
+	callback := rawCallback
+	delete(rawCancels, requestID)
+	rawMu.Unlock()
+
+	if callback == nil {
+		return
 	}
+
+	var metaC, errC *C.char
+	var bodyC unsafe.Pointer
+	if errJSON != "" {
+		errC = C.CString(errJSON)
+	} else {
+		metaC = C.CString(string(meta))
+		if len(body) > 0 {
+			bodyC = C.CBytes(body)
+		}
+	}
+
+	callbackThread.Do(func() { C.cb_start() })
+	C.enqueue_raw_callback(callback, C.int64_t(requestID), metaC, bodyC, C.int32_t(len(body)), errC)
+}
+
+func rawErrorJSON(err error) string {
+	data, _ := json.Marshal(ErrorResponse{Error: err.Error()})
+	return string(data)
+}
+
+func redirectHistory(history []*httpcloak.RedirectInfo) []RedirectInfo {
+	if len(history) == 0 {
+		return nil
+	}
+	out := make([]RedirectInfo, len(history))
+	for i, h := range history {
+		out[i] = RedirectInfo{StatusCode: h.StatusCode, URL: h.URL, Headers: h.Headers}
+	}
+	return out
+}
+
+// httpcloak_request_raw_async is httpcloak_request_async with the bodies carried as bytes. The
+// request body is copied before this returns, so the caller only has to pin it for the call.
+// Timeout in the request JSON is in seconds, as for httpcloak_request_async.
+//
+//export httpcloak_request_raw_async
+func httpcloak_request_raw_async(handle C.int64_t, requestJSON *C.char, body unsafe.Pointer, bodyLen C.int32_t, requestID C.int64_t) {
+	defer guardVoid("httpcloak_request_raw_async")
+	id := int64(requestID)
+	session := getSession(handle)
+
+	var config RequestConfig
+	if requestJSON != nil {
+		if err := json.Unmarshal([]byte(C.GoString(requestJSON)), &config); err != nil {
+			deliverRaw(id, nil, nil, rawErrorJSON(fmt.Errorf("request JSON is not valid: %w", err)))
+			return
+		}
+	}
+	if config.Method == "" {
+		config.Method = "GET"
+	}
+
+	var bodyBytes []byte
+	if body != nil && bodyLen > 0 {
+		bodyBytes = C.GoBytes(body, C.int(bodyLen))
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	rawMu.Lock()
+	rawCancels[id] = cancel
+	rawMu.Unlock()
+
+	go func() {
+		defer cancel()
+		defer func() {
+			if r := recover(); r != nil {
+				logClibPanic("request_raw_async goroutine", r)
+				deliverRaw(id, nil, nil, rawErrorJSON(fmt.Errorf("internal panic: %v", r)))
+			}
+		}()
+
+		if session == nil {
+			deliverRaw(id, nil, nil, rawErrorJSON(ErrInvalidSession))
+			return
+		}
+
+		if config.Timeout > 0 {
+			var timeoutCancel context.CancelFunc
+			ctx, timeoutCancel = context.WithTimeout(ctx, time.Duration(config.Timeout)*time.Second)
+			defer timeoutCancel()
+		}
+
+		var bodyReader io.Reader
+		if len(bodyBytes) > 0 {
+			bodyReader = bytes.NewReader(bodyBytes)
+		}
+
+		req := &httpcloak.Request{
+			Method:                        config.Method,
+			URL:                           config.URL,
+			Headers:                       buildHeaders(config.Headers, config.FetchMode),
+			ExactHeaders:                  buildExactHeaders(config.ExactHeaders),
+			HeaderOrder:                   config.HeaderOrder,
+			Body:                          bodyReader,
+			FollowRedirects:               config.FollowRedirects,
+			DisableConditionalCache:       config.DisableConditionalCache,
+			DisableClientHints:            config.DisableClientHints,
+			DisableHighEntropyClientHints: config.DisableHighEntropyClientHints,
+			DisableRedirectReferer:        config.DisableRedirectReferer,
+		}
+
+		resp, err := session.Do(ctx, req)
+		if err != nil {
+			deliverRaw(id, nil, nil, rawErrorJSON(err))
+			return
+		}
+
+		var respBody []byte
+		if resp.Body != nil {
+			respBody, err = io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if err != nil {
+				deliverRaw(id, nil, nil, rawErrorJSON(fmt.Errorf("reading response body: %w", err)))
+				return
+			}
+		}
+
+		meta := ResponseMetadata{
+			StatusCode:     resp.StatusCode,
+			Headers:        resp.Headers,
+			HeaderOrder:    resp.HeaderOrder,
+			HeaderCasing:   resp.HeaderCasing,
+			RequestHeaders: headerPairs(resp.RequestHeaders),
+			Trailer:        resp.Trailer,
+			BodyLen:        len(respBody),
+			EncodedBodyLen: resp.EncodedBodyLen,
+			Timing:         resp.Timing,
+			FinalURL:       resp.FinalURL,
+			Protocol:       resp.Protocol,
+			Cookies:        parseSetCookieHeaders(resp.Headers),
+			History:        redirectHistory(resp.History),
+		}
+		metaJSON, _ := json.Marshal(meta)
+		deliverRaw(id, metaJSON, respBody, "")
+	}()
 }
 
 //export httpcloak_get_async
@@ -1926,17 +2271,18 @@ func httpcloak_get_async(handle C.int64_t, url *C.char, optionsJSON *C.char, cal
 
 		body, bodyEncoding := encodeResponseBody(bodyBytes)
 		data := ResponseData{
-			StatusCode:   resp.StatusCode,
-			Headers:      resp.Headers,
-			HeaderOrder:  resp.HeaderOrder,
-			HeaderCasing: resp.HeaderCasing,
-			Trailer:      resp.Trailer,
-			Body:         body,
-			BodyEncoding: bodyEncoding,
-			FinalURL:     resp.FinalURL,
-			Protocol:     resp.Protocol,
-			Cookies:      cookies,
-			History:      history,
+			StatusCode:     resp.StatusCode,
+			Headers:        resp.Headers,
+			HeaderOrder:    resp.HeaderOrder,
+			HeaderCasing:   resp.HeaderCasing,
+			RequestHeaders: headerPairs(resp.RequestHeaders),
+			Trailer:        resp.Trailer,
+			Body:           body,
+			BodyEncoding:   bodyEncoding,
+			FinalURL:       resp.FinalURL,
+			Protocol:       resp.Protocol,
+			Cookies:        cookies,
+			History:        history,
 		}
 		jsonData, _ := json.Marshal(data)
 		invokeCallback(int64(callbackID), string(jsonData), "")
@@ -2047,17 +2393,18 @@ func httpcloak_post_async(handle C.int64_t, url *C.char, body *C.char, optionsJS
 
 		body, bodyEncoding := encodeResponseBody(bodyBytes)
 		data := ResponseData{
-			StatusCode:   resp.StatusCode,
-			Headers:      resp.Headers,
-			HeaderOrder:  resp.HeaderOrder,
-			HeaderCasing: resp.HeaderCasing,
-			Trailer:      resp.Trailer,
-			Body:         body,
-			BodyEncoding: bodyEncoding,
-			FinalURL:     resp.FinalURL,
-			Protocol:     resp.Protocol,
-			Cookies:      cookies,
-			History:      history,
+			StatusCode:     resp.StatusCode,
+			Headers:        resp.Headers,
+			HeaderOrder:    resp.HeaderOrder,
+			HeaderCasing:   resp.HeaderCasing,
+			RequestHeaders: headerPairs(resp.RequestHeaders),
+			Trailer:        resp.Trailer,
+			Body:           body,
+			BodyEncoding:   bodyEncoding,
+			FinalURL:       resp.FinalURL,
+			Protocol:       resp.Protocol,
+			Cookies:        cookies,
+			History:        history,
 		}
 		jsonData, _ := json.Marshal(data)
 		invokeCallback(int64(callbackID), string(jsonData), "")
@@ -2159,17 +2506,18 @@ func httpcloak_request_async(handle C.int64_t, requestJSON *C.char, callbackID C
 
 		body, bodyEncoding := encodeResponseBody(bodyBytes)
 		data := ResponseData{
-			StatusCode:   resp.StatusCode,
-			Headers:      resp.Headers,
-			HeaderOrder:  resp.HeaderOrder,
-			HeaderCasing: resp.HeaderCasing,
-			Trailer:      resp.Trailer,
-			Body:         body,
-			BodyEncoding: bodyEncoding,
-			FinalURL:     resp.FinalURL,
-			Protocol:     resp.Protocol,
-			Cookies:      cookies,
-			History:      history,
+			StatusCode:     resp.StatusCode,
+			Headers:        resp.Headers,
+			HeaderOrder:    resp.HeaderOrder,
+			HeaderCasing:   resp.HeaderCasing,
+			RequestHeaders: headerPairs(resp.RequestHeaders),
+			Trailer:        resp.Trailer,
+			Body:           body,
+			BodyEncoding:   bodyEncoding,
+			FinalURL:       resp.FinalURL,
+			Protocol:       resp.Protocol,
+			Cookies:        cookies,
+			History:        history,
 		}
 		jsonData, _ := json.Marshal(data)
 		invokeCallback(int64(callbackID), string(jsonData), "")
@@ -4326,16 +4674,17 @@ func httpcloak_upload_finish(uploadHandle C.int64_t) (hcRet *C.char) {
 
 	body, bodyEncoding := encodeResponseBody(bodyBytes)
 	responseData := ResponseData{
-		StatusCode:   resp.StatusCode,
-		Headers:      resp.Headers,
-		HeaderOrder:  resp.HeaderOrder,
-		HeaderCasing: resp.HeaderCasing,
-		Trailer:      resp.Trailer,
-		Body:         body,
-		BodyEncoding: bodyEncoding,
-		FinalURL:     resp.FinalURL,
-		Protocol:     resp.Protocol,
-		Cookies:      cookies,
+		StatusCode:     resp.StatusCode,
+		Headers:        resp.Headers,
+		HeaderOrder:    resp.HeaderOrder,
+		HeaderCasing:   resp.HeaderCasing,
+		RequestHeaders: headerPairs(resp.RequestHeaders),
+		Trailer:        resp.Trailer,
+		Body:           body,
+		BodyEncoding:   bodyEncoding,
+		FinalURL:       resp.FinalURL,
+		Protocol:       resp.Protocol,
+		Cookies:        cookies,
 	}
 
 	jsonData, err := json.Marshal(responseData)
@@ -4679,6 +5028,19 @@ func buildExactHeaders(pairs [][]string) []fingerprint.HeaderPair {
 	}
 	if len(out) == 0 {
 		return nil
+	}
+	return out
+}
+
+// headerPairs is the reverse of buildExactHeaders: a sent header list in the
+// [name, value] shape the request config takes it in.
+func headerPairs(headers []fingerprint.HeaderPair) [][]string {
+	if len(headers) == 0 {
+		return nil
+	}
+	out := make([][]string, len(headers))
+	for i, hp := range headers {
+		out[i] = []string{hp.Key, hp.Value}
 	}
 	return out
 }

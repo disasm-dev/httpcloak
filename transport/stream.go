@@ -146,6 +146,14 @@ func (r *StreamResponse) IsSuccess() bool {
 // DoStream executes an HTTP request and returns a streaming response
 // The caller is responsible for closing the response when done
 func (t *Transport) DoStream(ctx context.Context, req *Request) (*StreamResponse, error) {
+	resp, err := t.doStream(ctx, req)
+	if err == nil && resp != nil {
+		t.learnAltSvc(req.URL, resp.Headers)
+	}
+	return resp, err
+}
+
+func (t *Transport) doStream(ctx context.Context, req *Request) (*StreamResponse, error) {
 	// Parse URL to determine scheme
 	parsedURL, err := url.Parse(req.URL)
 	if err != nil {
@@ -265,6 +273,9 @@ func (t *Transport) doStreamAuto(ctx context.Context, req *Request) (*StreamResp
 	known, ok := t.protocolSupport[host]
 	t.protocolSupportMu.RUnlock()
 	if ok {
+		if known != ProtocolHTTP3 {
+			t.maybeUpgradeToH3(snap, req.URL)
+		}
 		switch known {
 		case ProtocolHTTP3:
 			resp, err := t.doStreamHTTP3(ctx, req)

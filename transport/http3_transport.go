@@ -387,6 +387,9 @@ func (t *HTTP3Transport) SetPreset(preset *fingerprint.Preset) {
 	if id := preset.QUICClientHelloID; id.Client != "" {
 		t.clientHelloID = &id
 	}
+	if t.tlsConfig != nil {
+		t.tlsConfig.TicketAgeWholeSeconds = preset.TLSTicketAgeWholeSeconds()
+	}
 	t.cachedClientHelloSpec = t.getSpecForHost("")
 	t.Refresh()
 }
@@ -440,10 +443,14 @@ func (t *HTTP3Transport) hasSessionForHost(host string) bool {
 //
 // The PSK variant (which carries the early_data + pre_shared_key extensions) is
 // used only when there is a cached session to resume; Chrome does not send
-// early_data on a fresh connection.
+// early_data on a fresh connection. Its early_data goes too unless the resumption
+// may offer 0-RTT; see earlyDataAllowed.
 func (t *HTTP3Transport) getSpecForHost(host string) *utls.ClientHelloSpec {
 	if t.preset.QUICPSKClientHelloID.Client != "" && t.hasSessionForHost(host) {
 		if spec, err := fingerprint.SpecForWithAnchors(t.preset.QUICPSKClientHelloID, t.shuffleSeed, t.preset.QUICSignatureAlgorithms, t.preset.TrustAnchors); err == nil {
+			if !t.earlyDataAllowed(host) {
+				spec.Extensions = withoutEarlyData(spec.Extensions)
+			}
 			return spec
 		}
 	}
@@ -461,6 +468,9 @@ func (t *HTTP3Transport) getSpecForHost(host string) *utls.ClientHelloSpec {
 func (t *HTTP3Transport) getInnerSpecForHost(host string) *utls.ClientHelloSpec {
 	if t.preset.QUICPSKClientHelloID.Client != "" && t.hasSessionForHost(host) {
 		if spec, err := fingerprint.SpecForWithAnchors(t.preset.QUICPSKClientHelloID, t.shuffleSeed, t.preset.QUICSignatureAlgorithms, t.preset.TrustAnchors); err == nil {
+			if !t.earlyDataAllowed(host) {
+				spec.Extensions = withoutEarlyData(spec.Extensions)
+			}
 			return spec
 		}
 	}
@@ -470,6 +480,56 @@ func (t *HTTP3Transport) getInnerSpecForHost(host string) *utls.ClientHelloSpec 
 		}
 	}
 	return nil
+}
+
+// earlyDataAllowed reports whether resuming host may offer 0-RTT.
+//
+// BoringSSL offers early data only on a session whose ticket allowed it
+// (early_data_offered requires ticket_max_early_data), so when a server's ticket
+// says no, Chrome's resumed ClientHello carries no early_data at all. Cloudflare
+// issues exactly that ticket on a zone with 0-RTT switched off. The PSK spec
+// offered it regardless, the server rejected the 0-RTT, and quic-go gave the
+// request an unusable connection.
+//
+// A host that has rejected early data is not offered it again either. That is
+// what makes the 0-RTT retry in RoundTrip different from the attempt that
+// failed: it resumes without early data. Dropping the session cache in
+// recordHandshakeState could not do it, because dialQUIC builds its own TLS
+// config and never saw that change.
+func (t *HTTP3Transport) earlyDataAllowed(host string) bool {
+	t.mu.RLock()
+	rejected := t.zeroRTTRejected[host]
+	t.mu.RUnlock()
+	if rejected {
+		return false
+	}
+	cache, ok := t.sessionCache.(*PersistableSessionCache)
+	if !ok {
+		return false
+	}
+	cs, found := cache.Get(host)
+	if !found || cs == nil {
+		return false
+	}
+	_, state, err := cs.ResumptionState()
+	return err == nil && state != nil && state.EarlyData
+}
+
+// withoutEarlyData returns exts without the early_data extension (42).
+func withoutEarlyData(exts []utls.TLSExtension) []utls.TLSExtension {
+	out := make([]utls.TLSExtension, 0, len(exts))
+	for _, e := range exts {
+		switch x := e.(type) {
+		case *utls.FakeEarlyDataExtension:
+			continue
+		case *utls.GenericExtension:
+			if x.Id == 42 {
+				continue
+			}
+		}
+		out = append(out, e)
+	}
+	return out
 }
 
 // NewHTTP3Transport creates a new HTTP/3 transport
@@ -525,7 +585,7 @@ func NewHTTP3TransportWithTransportConfig(preset *fingerprint.Preset, dnsCache *
 		spec, err := utls.UTLSIdToSpecWithSeed(*clientHelloID, shuffleSeed)
 		if err == nil {
 			fingerprint.ApplySignatureAlgorithms(spec.Extensions, preset.QUICSignatureAlgorithms)
-			fingerprint.ApplyTrustAnchors(&spec.Extensions, preset.TrustAnchors)
+			fingerprint.ApplyTrustAnchors(&spec.Extensions, preset.TrustAnchors, utls.PermutesExtensions(*clientHelloID))
 			t.cachedClientHelloSpec = &spec
 		}
 	}
@@ -535,7 +595,7 @@ func NewHTTP3TransportWithTransportConfig(preset *fingerprint.Preset, dnsCache *
 	if preset.QUICPSKClientHelloID.Client != "" {
 		if pskSpec, err := utls.UTLSIdToSpecWithSeed(preset.QUICPSKClientHelloID, shuffleSeed); err == nil {
 			fingerprint.ApplySignatureAlgorithms(pskSpec.Extensions, preset.QUICSignatureAlgorithms)
-			fingerprint.ApplyTrustAnchors(&pskSpec.Extensions, preset.TrustAnchors)
+			fingerprint.ApplyTrustAnchors(&pskSpec.Extensions, preset.TrustAnchors, utls.PermutesExtensions(preset.QUICPSKClientHelloID))
 			t.cachedClientHelloSpecPSK = &pskSpec
 		}
 	}
@@ -552,10 +612,11 @@ func NewHTTP3TransportWithTransportConfig(preset *fingerprint.Preset, dnsCache *
 	// Only enable session cache if we have PSK spec - prevents panic when session
 	// is cached but spec doesn't have PSK extension (TOCTOU race mitigation)
 	t.tlsConfig = &tls.Config{
-		NextProtos:         []string{http3.NextProtoH3},
-		MinVersion:         tls.VersionTLS13,
-		InsecureSkipVerify: t.insecureSkipVerify,
-		KeyLogWriter:       keyLogWriter,
+		NextProtos:            []string{http3.NextProtoH3},
+		MinVersion:            tls.VersionTLS13,
+		InsecureSkipVerify:    t.insecureSkipVerify,
+		KeyLogWriter:          keyLogWriter,
+		TicketAgeWholeSeconds: preset.TLSTicketAgeWholeSeconds(),
 	}
 	t.tlsVerify.Apply(t.tlsConfig)
 	if t.cachedClientHelloSpecPSK != nil {
@@ -685,7 +746,7 @@ func NewHTTP3TransportWithConfig(preset *fingerprint.Preset, dnsCache *dns.Cache
 		spec, err := utls.UTLSIdToSpecWithSeed(*clientHelloID, shuffleSeed)
 		if err == nil {
 			fingerprint.ApplySignatureAlgorithms(spec.Extensions, preset.QUICSignatureAlgorithms)
-			fingerprint.ApplyTrustAnchors(&spec.Extensions, preset.TrustAnchors)
+			fingerprint.ApplyTrustAnchors(&spec.Extensions, preset.TrustAnchors, utls.PermutesExtensions(*clientHelloID))
 			t.cachedClientHelloSpec = &spec
 		}
 	}
@@ -694,7 +755,7 @@ func NewHTTP3TransportWithConfig(preset *fingerprint.Preset, dnsCache *dns.Cache
 	if preset.QUICPSKClientHelloID.Client != "" {
 		if pskSpec, err := utls.UTLSIdToSpecWithSeed(preset.QUICPSKClientHelloID, shuffleSeed); err == nil {
 			fingerprint.ApplySignatureAlgorithms(pskSpec.Extensions, preset.QUICSignatureAlgorithms)
-			fingerprint.ApplyTrustAnchors(&pskSpec.Extensions, preset.TrustAnchors)
+			fingerprint.ApplyTrustAnchors(&pskSpec.Extensions, preset.TrustAnchors, utls.PermutesExtensions(preset.QUICPSKClientHelloID))
 			t.cachedClientHelloSpecPSK = &pskSpec
 		}
 	}
@@ -711,10 +772,11 @@ func NewHTTP3TransportWithConfig(preset *fingerprint.Preset, dnsCache *dns.Cache
 	// Only enable session cache if we have PSK spec - prevents panic when session
 	// is cached but spec doesn't have PSK extension (TOCTOU race mitigation)
 	t.tlsConfig = &tls.Config{
-		NextProtos:         []string{http3.NextProtoH3},
-		MinVersion:         tls.VersionTLS13,
-		InsecureSkipVerify: t.insecureSkipVerify,
-		KeyLogWriter:       keyLogWriter,
+		NextProtos:            []string{http3.NextProtoH3},
+		MinVersion:            tls.VersionTLS13,
+		InsecureSkipVerify:    t.insecureSkipVerify,
+		KeyLogWriter:          keyLogWriter,
+		TicketAgeWholeSeconds: preset.TLSTicketAgeWholeSeconds(),
 	}
 	t.tlsVerify.Apply(t.tlsConfig)
 	if t.cachedClientHelloSpecPSK != nil {
@@ -809,7 +871,7 @@ func NewHTTP3TransportWithMASQUE(preset *fingerprint.Preset, dnsCache *dns.Cache
 		spec, err := utls.UTLSIdToSpecWithSeed(*clientHelloID, shuffleSeed)
 		if err == nil {
 			fingerprint.ApplySignatureAlgorithms(spec.Extensions, preset.QUICSignatureAlgorithms)
-			fingerprint.ApplyTrustAnchors(&spec.Extensions, preset.TrustAnchors)
+			fingerprint.ApplyTrustAnchors(&spec.Extensions, preset.TrustAnchors, utls.PermutesExtensions(*clientHelloID))
 			t.cachedClientHelloSpec = &spec
 		}
 		// Create separate cached spec for inner connections (not shared with outer)
@@ -817,7 +879,7 @@ func NewHTTP3TransportWithMASQUE(preset *fingerprint.Preset, dnsCache *dns.Cache
 		innerSpec, err := utls.UTLSIdToSpecWithSeed(*clientHelloID, shuffleSeed)
 		if err == nil {
 			fingerprint.ApplySignatureAlgorithms(innerSpec.Extensions, preset.QUICSignatureAlgorithms)
-			fingerprint.ApplyTrustAnchors(&innerSpec.Extensions, preset.TrustAnchors)
+			fingerprint.ApplyTrustAnchors(&innerSpec.Extensions, preset.TrustAnchors, utls.PermutesExtensions(*clientHelloID))
 			t.cachedClientHelloSpecInner = &innerSpec
 		}
 	}
@@ -827,13 +889,13 @@ func NewHTTP3TransportWithMASQUE(preset *fingerprint.Preset, dnsCache *dns.Cache
 		// Outer PSK spec
 		if pskSpec, err := utls.UTLSIdToSpecWithSeed(preset.QUICPSKClientHelloID, shuffleSeed); err == nil {
 			fingerprint.ApplySignatureAlgorithms(pskSpec.Extensions, preset.QUICSignatureAlgorithms)
-			fingerprint.ApplyTrustAnchors(&pskSpec.Extensions, preset.TrustAnchors)
+			fingerprint.ApplyTrustAnchors(&pskSpec.Extensions, preset.TrustAnchors, utls.PermutesExtensions(preset.QUICPSKClientHelloID))
 			t.cachedClientHelloSpecPSK = &pskSpec
 		}
 		// Inner PSK spec for MASQUE connections
 		if innerPskSpec, err := utls.UTLSIdToSpecWithSeed(preset.QUICPSKClientHelloID, shuffleSeed); err == nil {
 			fingerprint.ApplySignatureAlgorithms(innerPskSpec.Extensions, preset.QUICSignatureAlgorithms)
-			fingerprint.ApplyTrustAnchors(&innerPskSpec.Extensions, preset.TrustAnchors)
+			fingerprint.ApplyTrustAnchors(&innerPskSpec.Extensions, preset.TrustAnchors, utls.PermutesExtensions(preset.QUICPSKClientHelloID))
 			t.cachedClientHelloSpecInnerPSK = &innerPskSpec
 		}
 	}
@@ -850,10 +912,11 @@ func NewHTTP3TransportWithMASQUE(preset *fingerprint.Preset, dnsCache *dns.Cache
 	// Only enable session cache if we have PSK spec - prevents panic when session
 	// is cached but spec doesn't have PSK extension (TOCTOU race mitigation)
 	t.tlsConfig = &tls.Config{
-		NextProtos:         []string{http3.NextProtoH3},
-		MinVersion:         tls.VersionTLS13,
-		InsecureSkipVerify: t.insecureSkipVerify,
-		KeyLogWriter:       keyLogWriter,
+		NextProtos:            []string{http3.NextProtoH3},
+		MinVersion:            tls.VersionTLS13,
+		InsecureSkipVerify:    t.insecureSkipVerify,
+		KeyLogWriter:          keyLogWriter,
+		TicketAgeWholeSeconds: preset.TLSTicketAgeWholeSeconds(),
 	}
 	t.tlsVerify.Apply(t.tlsConfig)
 	if t.cachedClientHelloSpecPSK != nil {
@@ -1337,9 +1400,10 @@ func (t *HTTP3Transport) recordHandshakeState(
 	}
 	return func(ctx context.Context, addr string, tlsCfg *tls.Config, cfg *quic.Config) (*quic.Conn, error) {
 		// A host that rejected early data once will reject it again. Dropping
-		// the session cache for that dial forces a full handshake, which is the
-		// only thing that makes the retry different from the attempt that just
-		// failed.
+		// the session cache for that dial forces a full handshake on a dialer
+		// that uses the config it is handed. dialQUIC builds its own config and
+		// never sees this; for it, earlyDataAllowed keeps early data out of the
+		// retry's ClientHello instead, which is what makes that retry differ.
 		if host, _, splitErr := net.SplitHostPort(addr); splitErr == nil {
 			t.mu.RLock()
 			rejected := t.zeroRTTRejected[host]
@@ -2050,10 +2114,11 @@ func (t *HTTP3Transport) Connect(ctx context.Context, host, port string) error {
 
 	// Create TLS config - use request host for SNI
 	tlsCfg := &tls.Config{
-		ServerName:         host,
-		NextProtos:         []string{"h3"},
-		InsecureSkipVerify: t.insecureSkipVerify,
-		KeyLogWriter:       keyLogWriter,
+		ServerName:            host,
+		NextProtos:            []string{"h3"},
+		InsecureSkipVerify:    t.insecureSkipVerify,
+		KeyLogWriter:          keyLogWriter,
+		TicketAgeWholeSeconds: t.preset.TLSTicketAgeWholeSeconds(),
 	}
 	t.tlsVerify.Apply(tlsCfg)
 
@@ -2164,10 +2229,11 @@ func (t *HTTP3Transport) connectViaProxy(ctx context.Context, host, port string)
 	// ServerName; dialQUICWithProxy clones t.tlsConfig and ignores this. Both
 	// build their own quic.Config, so the cfg arg is unused (pass nil).
 	tlsCfg := &tls.Config{
-		ServerName:         host,
-		NextProtos:         []string{"h3"},
-		InsecureSkipVerify: t.insecureSkipVerify,
-		KeyLogWriter:       keyLogWriter,
+		ServerName:            host,
+		NextProtos:            []string{"h3"},
+		InsecureSkipVerify:    t.insecureSkipVerify,
+		KeyLogWriter:          keyLogWriter,
+		TicketAgeWholeSeconds: t.preset.TLSTicketAgeWholeSeconds(),
 	}
 	t.tlsVerify.Apply(tlsCfg)
 

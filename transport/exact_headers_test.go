@@ -1,6 +1,8 @@
 package transport
 
 import (
+	"bufio"
+	"bytes"
 	"testing"
 
 	http "github.com/sardanioss/http"
@@ -166,5 +168,45 @@ func TestExactHeadersShortCircuitIsWired(t *testing.T) {
 	order := req.Header[http.HeaderOrderKey]
 	if len(order) != 1 || order[0] != "Only-This" {
 		t.Errorf("header order = %v, want exactly [Only-This]", order)
+	}
+}
+
+// Host and Connection are written ahead of the ordered block, which is right
+// for a browser and wrong for a client that orders them differently: Android's
+// HttpURLConnection sends User-Agent, Host, Connection, Accept-Encoding. In
+// exact mode a listed Host or Connection keeps its slot; an unlisted Host is
+// still written first, since the request cannot go out without one.
+func TestExactHeadersKeepHostAndConnectionSlots(t *testing.T) {
+	write := func(t *testing.T, exact []fingerprint.HeaderPair) string {
+		t.Helper()
+		req, _ := http.NewRequest("GET", "https://api.example.com/_bm/get_info?deviceId=1", nil)
+		applyExactHeaders(req, exact, nil, nil, "h1")
+		var buf bytes.Buffer
+		conn := &http1Conn{bw: bufio.NewWriter(&buf)}
+		if err := (&HTTP1Transport{}).writeRequest(conn, req); err != nil {
+			t.Fatalf("writeRequest: %v", err)
+		}
+		return buf.String()
+	}
+
+	got := write(t, []fingerprint.HeaderPair{
+		hp("User-Agent", "Akamai BAPSDK/4.3.0-rc2 (Android; 13; Google; Pixel 4 XL; en)"),
+		hp("Host", "api.example.com"),
+		hp("Connection", "Keep-Alive"),
+		hp("Accept-Encoding", "gzip"),
+	})
+	want := "GET /_bm/get_info?deviceId=1 HTTP/1.1\r\n" +
+		"User-Agent: Akamai BAPSDK/4.3.0-rc2 (Android; 13; Google; Pixel 4 XL; en)\r\n" +
+		"Host: api.example.com\r\n" +
+		"Connection: Keep-Alive\r\n" +
+		"Accept-Encoding: gzip\r\n\r\n"
+	if got != want {
+		t.Errorf("listed Host and Connection lost their slots\n got: %q\nwant: %q", got, want)
+	}
+
+	got = write(t, []fingerprint.HeaderPair{hp("User-Agent", "mirror"), hp("Accept", "*/*")})
+	want = "GET /_bm/get_info?deviceId=1 HTTP/1.1\r\nHost: api.example.com\r\nUser-Agent: mirror\r\nAccept: */*\r\n\r\n"
+	if got != want {
+		t.Errorf("unlisted Host must still lead, and no Connection may be added\n got: %q\nwant: %q", got, want)
 	}
 }

@@ -483,11 +483,12 @@ func (p *QUICHostPool) createConn(ctx context.Context) (*QUICConn, error) {
 	// TLS config for QUIC (HTTP/3)
 	// Use sniHost (original request host) for TLS ServerName, not p.host (which may be connectTo target)
 	tlsConfig := &tls.Config{
-		ServerName:         p.sniHost,
-		InsecureSkipVerify: p.insecureSkipVerify,
-		NextProtos:         []string{http3.NextProtoH3}, // HTTP/3 ALPN
-		MinVersion:         tls.VersionTLS13,
-		KeyLogWriter:       keyLogWriter,
+		ServerName:            p.sniHost,
+		InsecureSkipVerify:    p.insecureSkipVerify,
+		NextProtos:            []string{http3.NextProtoH3}, // HTTP/3 ALPN
+		MinVersion:            tls.VersionTLS13,
+		KeyLogWriter:          keyLogWriter,
+		TicketAgeWholeSeconds: p.preset.TLSTicketAgeWholeSeconds(),
 	}
 	p.tlsVerify.Apply(tlsConfig)
 

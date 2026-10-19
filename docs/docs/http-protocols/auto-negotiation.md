@@ -8,14 +8,14 @@ import TabItem from '@theme/TabItem';
 
 # Auto-Negotiation
 
-Auto-negotiation is the default. The lib races H3 and H2 in parallel, takes whichever connects first, and falls back to H1 only when H2 fails ALPN. No protocol pick on your end, just Chrome-shaped bytes on whichever wire the target actually serves.
+Auto-negotiation is the default, and it picks protocols the way Chrome does. H2 over TCP is the starting point, with H1 when H2 fails ALPN. H3 comes in only for a host that has said it speaks it, through an Alt-Svc header on an earlier response or an `h3` in its DNS HTTPS record, and for such a host the lib races H3 against H2 and takes whichever connects first. Chrome never opens a QUIC connection to a server that has not advertised HTTP/3, so neither does the lib. No protocol pick on your end, just Chrome-shaped bytes on whichever wire the target actually serves.
 
 ## What `doAuto` does
 
 The dispatcher in `transport/transport.go` is one function, `doAuto`. The steps it runs:
 
-1. Look up the host in the `protocolSupport` cache. If a prior request already learned this host's best protocol, skip the race and dial that directly.
-2. Otherwise fire two goroutines: one dials H3 over UDP via QUIC, the other dials H2 over TCP+TLS.
+1. Look up the host in the `protocolSupport` cache. If a prior request already learned this host's best protocol, skip the race and dial that directly. A host on H2 or H1 that has since advertised H3 through Alt-Svc keeps using its live connection for this request while an H3 connection comes up in the background; once that is up, the host moves to H3. That is what Chrome does with a live HTTP/2 session.
+2. Otherwise fire two goroutines: one dials H2 over TCP+TLS, the other dials H3 over UDP via QUIC, but only when the host has advertised HTTP/3. For any other host the H3 side bows out at once without sending a packet.
 3. Take the first success. Cancel the loser.
 4. If H2's TLS handshake came back with `http/1.1` in ALPN (`ALPNMismatchError`), reuse that same TLS connection for an H1 request. No second handshake.
 5. If both attempts fail (or the 6-second race budget elapses), fall through to H1 on a fresh TCP connection. There's no extra H2 retry; H2 already had its shot inside the race.
@@ -27,10 +27,10 @@ The race lives in `raceH3H2`. It dodges the 5-second wall you'd hit when H3 went
 
 Two ways:
 
-- **Alt-Svc**. The first H2 response from a host carries `alt-svc: h3=":443"; ma=86400`. The lib parses it, the `protocolSupport` cache learns the host speaks H3, and the next request can race H3 against H2. H3 usually wins because the QUIC handshake finishes in fewer round trips.
-- **DNS HTTPS RR**. RFC 9460 HTTPS records advertise ALPN values directly in DNS. If the resolver returns one with `h3` in it, the lib can skip the H2 detour entirely. Whether this fires depends on your DNS config in `dns/`.
+- **Alt-Svc**. A response carries `alt-svc: h3=":443"; ma=86400`. The lib records it for that origin for `ma` seconds (a day when `ma` is absent), and the host is brought up to H3 as described above. A later header without `h3`, or `alt-svc: clear`, withdraws it. Only `h3` on the origin's own host and port counts, since that is where the QUIC dial goes.
+- **DNS HTTPS RR**. RFC 9460 HTTPS records advertise ALPN values directly in DNS. A service record for the name itself, with `h3` in its `alpn` and no `port` parameter, lets the first request race H3 against H2. The record comes from the same HTTPS query the ECH lookup makes (the servers set with `dns.SetECHDNSServers`), runs alongside the TCP dial so it costs H2 nothing, and is consulted only on a direct connection to port 443. Through a proxy only Alt-Svc counts, as in Chrome, which resolves nothing itself when proxied.
 
-When neither hint mentions H3, the race still includes H3 on the first try, but H3's handshake is unlikely to land first.
+When neither hint mentions H3, no QUIC packet is sent.
 
 ## When H1 shows up
 

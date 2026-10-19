@@ -124,4 +124,4 @@ If H3 is wanted sometimes and H2 other times, keep two sessions rather than togg
 
 ## Protocol values
 
-`RefreshWithProtocol` accepts `"h1"`/`"http1"`/`"1"` for HTTP/1.1, `"h2"`/`"http2"`/`"2"` for HTTP/2, `"h3"`/`"http3"`/`"3"` for HTTP/3, and `"auto"` (or empty string) to race H3 against H2 with fallback to H1. Anything else returns an error.
+`RefreshWithProtocol` accepts `"h1"`/`"http1"`/`"1"` for HTTP/1.1, `"h2"`/`"http2"`/`"2"` for HTTP/2, `"h3"`/`"http3"`/`"3"` for HTTP/3, and `"auto"` (or empty string) for auto-negotiation: H2 with fallback to H1, and H3 raced against H2 once the host has advertised it. Anything else returns an error.

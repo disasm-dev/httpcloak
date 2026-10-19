@@ -1,7 +1,9 @@
 package fingerprint
 
 import (
+	"math/rand/v2"
 	"runtime"
+	"strings"
 	"time"
 
 	tls "github.com/sardanioss/utls"
@@ -171,8 +173,82 @@ func SpecForWithAnchors(id tls.ClientHelloID, seed int64, sigAlgs []tls.Signatur
 		return nil, err
 	}
 	ApplySignatureAlgorithms(spec.Extensions, sigAlgs)
-	ApplyTrustAnchors(&spec.Extensions, anchors)
+	ApplyTrustAnchors(&spec.Extensions, anchors, tls.PermutesExtensions(id))
 	return &spec, nil
+}
+
+// TLSTicketAgeWholeSeconds reports whether this profile's TLS stack puts the
+// ticket age of a resumed session on the wire in whole seconds, which is what
+// utls.Config.TicketAgeWholeSeconds selects. BoringSSL does, and so every
+// Chromium and Apple client does:
+//
+//	uint32_t ticket_age = 1000 * (now.tv_sec - session->time);
+//
+// OpenSSL does too. NSS (Firefox) and Go measure it to the millisecond, so
+// those keep the millisecond age.
+//
+// A JA3 or captured-hello profile has no ClientHelloID to go by, and for
+// those the User-Agent is the profile's own statement of which client it is.
+// Firefox on iOS says FxiOS rather than Firefox/, which is right: it runs on
+// Apple's stack.
+func (p *Preset) TLSTicketAgeWholeSeconds() bool {
+	switch p.ClientHelloID.Client {
+	case "Firefox", "Golang":
+		return false
+	case "":
+		return !strings.Contains(p.UserAgent, "Firefox/")
+	}
+	return true
+}
+
+// TLSOmitCloseNotify reports whether this profile ends a TLS connection
+// without a close_notify alert, which is what utls.Config.OmitCloseNotify
+// selects. Chromium never sends one: SSLClientSocketImpl::Disconnect drops the
+// socket without calling SSL_shutdown. NSS sends one from ssl_SecureClose, so
+// Firefox keeps it, and so does anything this cannot place as Chromium, which
+// is the previous behaviour. Chrome on iOS runs on Apple's stack rather than
+// Chromium's, and its User-Agent says CriOS rather than Chrome/.
+func (p *Preset) TLSOmitCloseNotify() bool {
+	return p.chromiumNetStack()
+}
+
+// TLSFalseStart reports whether this profile False Starts a TLS 1.2
+// handshake, sending application data before the server's Finished, which is
+// what utls.Config.FalseStart selects. Chromium sets SSL_MODE_ENABLE_FALSE_START
+// on every connection (SSLClientSocketImpl::Init).
+func (p *Preset) TLSFalseStart() bool {
+	return p.chromiumNetStack()
+}
+
+// TLSDeferKeyUpdateReply reports whether this profile holds its answer to a
+// peer's KeyUpdate until it next writes application data, which is what
+// utls.Config.DeferKeyUpdateReply selects. BoringSSL queues the reply in its
+// pending flight (tls13_receive_key_update), so an idle Chrome connection
+// answers nothing. It follows the split TLSTicketAgeWholeSeconds makes between
+// BoringSSL clients and Firefox or Go, which keep the immediate answer.
+func (p *Preset) TLSDeferKeyUpdateReply() bool {
+	return p.TLSTicketAgeWholeSeconds()
+}
+
+// H2ChromeSessionErrors reports whether this profile answers an HTTP/2 peer's
+// protocol errors as Chromium's SpdySession does, which is what the fork's
+// Transport.ChromeSessionErrors selects: a stray PING ACK closes the
+// connection, and GOAWAY carries Chromium's description as debug data.
+func (p *Preset) H2ChromeSessionErrors() bool {
+	return p.chromiumNetStack()
+}
+
+// chromiumNetStack reports whether this profile's connections are made by
+// Chromium's network stack. Chrome on iOS runs on Apple's stack rather than
+// Chromium's, and its User-Agent says CriOS rather than Chrome/, so it is not.
+func (p *Preset) chromiumNetStack() bool {
+	switch p.ClientHelloID.Client {
+	case "Chrome", "Edge", "360Browser", "QQBrowser":
+		return true
+	case "":
+		return strings.Contains(p.UserAgent, "Chrome/")
+	}
+	return false
 }
 
 // ApplySignatureAlgorithms replaces the signature_algorithms extension's list in
@@ -195,16 +271,25 @@ func ApplySignatureAlgorithms(exts []tls.TLSExtension, algs []tls.SignatureSchem
 // carrying anchors, and is a no-op when anchors is empty.
 //
 // It replaces an existing one rather than adding a second, so a spec that
-// already carries the extension (a captured hello, say) takes the preset's
-// list. Otherwise it inserts ahead of the trailing run of extensions that may
-// not move: GREASE brackets the list, padding sizes the record, and RFC 8446
-// 4.2.11 requires pre_shared_key to be last. Landing after those would pin the
-// extension to the final slot, where BoringSSL marks it out_compressible and so
-// takes part in the ordinary permutation like any other.
+// already carries the extension (a captured hello, say) keeps that slot and
+// takes the preset's list.
+//
+// Otherwise the slot depends on permute, which is whether the spec's extensions
+// were shuffled; pass tls.PermutesExtensions of the ID the spec came from.
+// BoringSSL lists trust_anchors in kExtensions, so Chrome permutes it with
+// everything else, and a spec shuffled before this runs has to get the same
+// draw here: any of the n+1 movable positions, equally likely. Appending it
+// after the shuffle instead left it just ahead of the closing GREASE on every
+// connection, which a real Chrome hello does one time in seventeen.
+//
+// An unpermuted spec gets the fixed slot ahead of the trailing run of
+// extensions that may not move: GREASE brackets the list, padding sizes the
+// record, and RFC 8446 4.2.11 requires pre_shared_key to be last.
+//
 // It takes a pointer to the slice, unlike ApplySignatureAlgorithms, because
 // adding an extension changes the slice header rather than an element. That
 // also lets the H1 path pass &tlsConn.Extensions, where there is no spec.
-func ApplyTrustAnchors(exts *[]tls.TLSExtension, anchors [][]byte) {
+func ApplyTrustAnchors(exts *[]tls.TLSExtension, anchors [][]byte, permute bool) {
 	if exts == nil || len(anchors) == 0 {
 		return
 	}
@@ -220,19 +305,39 @@ func ApplyTrustAnchors(exts *[]tls.TLSExtension, anchors [][]byte) {
 	}
 
 	at := len(*exts)
-	for at > 0 {
-		switch (*exts)[at-1].(type) {
-		case *tls.UtlsGREASEExtension, *tls.UtlsPaddingExtension, tls.PreSharedKeyExtension:
-			at--
-			continue
-		}
-		break
+	for at > 0 && tls.IsPositionInvariantExtension((*exts)[at-1]) {
+		at--
+	}
+	if permute {
+		at = randomMovableSlot(*exts, at)
 	}
 	out := make([]tls.TLSExtension, 0, len(*exts)+1)
 	out = append(out, (*exts)[:at]...)
 	out = append(out, ext)
 	out = append(out, (*exts)[at:]...)
 	*exts = out
+}
+
+// randomMovableSlot is the index to insert one more movable extension at,
+// drawn uniformly from the places it can hold among the movable extensions
+// already there: ahead of any one of them, or after the last. With the rest
+// already uniformly shuffled, that leaves the whole list uniformly shuffled.
+// fallback is returned when nothing in exts may move.
+func randomMovableSlot(exts []tls.TLSExtension, fallback int) int {
+	var movable []int
+	for i, e := range exts {
+		if !tls.IsPositionInvariantExtension(e) {
+			movable = append(movable, i)
+		}
+	}
+	if len(movable) == 0 {
+		return fallback
+	}
+	k := rand.IntN(len(movable) + 1)
+	if k == len(movable) {
+		return movable[len(movable)-1] + 1
+	}
+	return movable[k]
 }
 
 // TCPFingerprint contains TCP/IP stack parameters that identify the OS.
@@ -628,6 +733,24 @@ func (p *Preset) H2DataFrameMaxSize() uint32 {
 	return 0
 }
 
+// H2HeadersFrameMaxSize is the largest HEADERS or CONTINUATION payload this
+// profile will send, or 0 for whatever the peer advertised.
+//
+// Chromium's is 16374: quiche splits a header block so that no frame, header
+// included, exceeds kHttp2MaxControlFrameSendSize (16383). The first HEADERS
+// frame spends 5 of those bytes on its priority fields. Like DATA sizing it is
+// a constant that ignores the peer's SETTINGS_MAX_FRAME_SIZE, and like DATA
+// sizing it is derived from the client family, since Firefox and WebKit fill
+// the frame the peer allows.
+//
+// It only shows on a header block over 16KB, which is a large cookie jar.
+func (p *Preset) H2HeadersFrameMaxSize() uint32 {
+	if p.ClientHelloID.Client == "Chrome" {
+		return 16374
+	}
+	return 0
+}
+
 // H2HPACKRepresentation returns the per-name representation overrides, or nil
 // when the preset relies entirely on its base policy, which every shipped
 // browser profile does.
@@ -846,6 +969,25 @@ func (p *Preset) H3QUICInitialPacketSize() uint16 {
 		return *p.H3Config.QUICInitialPacketSize
 	}
 	return 1250 // Chrome default
+}
+
+// H3QUICInitialPacketSizeIPv6 is the QUIC packet size for a connection over
+// IPv6, or 0 for the same size as over IPv4.
+//
+// Chromium takes 20 bytes off on an IPv6 socket, the extra length of the IPv6
+// header over IPv4's (QuicChromiumClientSession, kAdditionalOverheadForIPv6),
+// so its 1250 becomes 1230. That is Chromium's code rather than a QUIC rule,
+// so only a Chromium QUIC identity gets it. Never below the 1200 an Initial
+// datagram needs.
+func (p *Preset) H3QUICInitialPacketSizeIPv6() uint16 {
+	id := p.QUICClientHelloID
+	if id.Client == "" {
+		id = p.ClientHelloID
+	}
+	if id.Client != "Chrome" {
+		return 0
+	}
+	return max(p.H3QUICInitialPacketSize()-20, 1200)
 }
 
 // H3QUICMaxIncomingStreams returns the max incoming bidirectional streams.

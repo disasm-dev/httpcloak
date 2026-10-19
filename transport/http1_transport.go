@@ -773,6 +773,10 @@ func (t *HTTP1Transport) createConn(ctx context.Context, host, port, scheme stri
 			OmitEmptyPsk:                       true,                 // Chrome sends no empty PSK on a first connection
 			PreferSkipResumptionOnNilExtension: true,                 // Skip resumption if spec has no PSK extension
 			KeyLogWriter:                       keyLogWriter,
+			TicketAgeWholeSeconds:              t.preset.TLSTicketAgeWholeSeconds(),
+			OmitCloseNotify:                    t.preset.TLSOmitCloseNotify(),
+			DeferKeyUpdateReply:                t.preset.TLSDeferKeyUpdateReply(),
+			FalseStart:                         t.preset.TLSFalseStart(),
 		}
 		t.tlsVerify.Apply(tlsConfig)
 		if useSessionCache {
@@ -1139,32 +1143,38 @@ func (t *HTTP1Transport) writeRequest(conn *http1Conn, req *http.Request) error 
 	}
 	fmt.Fprintf(conn.bw, "%s %s HTTP/1.1\r\n", req.Method, uri)
 
-	// Host header first (browser behavior)
-	host := req.Host
-	if host == "" {
-		host = req.URL.Host
-	}
-	fmt.Fprintf(conn.bw, "Host: %s\r\n", host)
-
-	// Connection header second, immediately after Host. Real Chrome emits
-	// "Connection: keep-alive" as the second request header on the HTTP/1.1 wire.
-	// Honor a caller-supplied value if present; otherwise default to keep-alive.
+	// Host header first (browser behavior), then Connection immediately after
+	// it. Real Chrome emits "Connection: keep-alive" as the second request
+	// header on the HTTP/1.1 wire. A caller-supplied Connection value is
+	// honored; otherwise it defaults to keep-alive.
 	//
-	// Exact-headers mode is the exception. Its contract is that nothing the
-	// caller did not list goes on the wire, and a caller reproducing a captured
-	// request that carries no Connection cannot have one added back. Nothing
-	// breaks by leaving it out: HTTP/1.1 keeps connections alive by default, so
-	// the header is a restatement of the default rather than what enables it,
-	// which is why suppressing it here does not cost the connection pool
-	// anything. HTTP/1.0 would be a different matter, and this writer only
-	// speaks 1.1.
-	connValue := req.Header.Get("Connection")
+	// Exact-headers mode is the exception on both counts. Its contract is that
+	// the wire carries the listed pairs in the listed order and nothing else.
+	// A caller reproducing a captured request that carries no Connection
+	// cannot have one added back; nothing breaks by leaving it out, since
+	// HTTP/1.1 keeps connections alive by default, so the header restates the
+	// default rather than enabling it. And a client that does not put Host
+	// first, as Android's HttpURLConnection does not (it sends User-Agent,
+	// Host, Connection, Accept-Encoding), can only be mirrored if a listed Host
+	// or Connection keeps its listed slot. So when the exact list names either
+	// of them, the ordered pass below writes it from the caller's pair instead.
 	exact := len(req.Header[exactHeadersKey]) > 0
-	if connValue == "" && !exact {
-		connValue = "keep-alive"
+	order := req.Header[http.HeaderOrderKey]
+	if !(exact && orderLists(order, "Host")) {
+		host := req.Host
+		if host == "" {
+			host = req.URL.Host
+		}
+		fmt.Fprintf(conn.bw, "Host: %s\r\n", host)
 	}
-	if connValue != "" {
-		fmt.Fprintf(conn.bw, "Connection: %s\r\n", connValue)
+	if !(exact && orderLists(order, "Connection")) {
+		connValue := req.Header.Get("Connection")
+		if connValue == "" && !exact {
+			connValue = "keep-alive"
+		}
+		if connValue != "" {
+			fmt.Fprintf(conn.bw, "Connection: %s\r\n", connValue)
+		}
 	}
 
 	// Determine if we need chunked encoding (unknown content length with body)
@@ -1329,8 +1339,19 @@ func valuesForSlot(vals []string, n, i int) []string {
 	return vals[i : i+1]
 }
 
+// orderLists reports whether an order list names the header, case-insensitively.
+func orderLists(order []string, name string) bool {
+	for _, key := range order {
+		if strings.EqualFold(key, name) {
+			return true
+		}
+	}
+	return false
+}
+
 // writeHeadersInOrder writes headers in a browser-like order
 func (t *HTTP1Transport) writeHeadersInOrder(w *bufio.Writer, req *http.Request, useChunked bool) {
+	exact := len(req.Header[exactHeadersKey]) > 0
 	// Check if custom header order is specified (from preset or user)
 	// This allows HTTP/1.1 to respect the same header ordering as H2/H3
 	var headerOrder []string
@@ -1423,12 +1444,14 @@ func (t *HTTP1Transport) writeHeadersInOrder(w *bufio.Writer, req *http.Request,
 		}
 
 		// Skip Host - already written before this function is called
-		if strings.EqualFold(key, "Host") {
+		// In exact mode a listed Host or Connection keeps its slot instead,
+		// and is written here from the caller's pair like any other header.
+		if !exact && strings.EqualFold(key, "Host") {
 			continue
 		}
 
 		// Skip Connection - already written immediately after Host
-		if strings.EqualFold(key, "Connection") {
+		if !exact && strings.EqualFold(key, "Connection") {
 			written[canonicalKey] = true
 			continue
 		}
@@ -1868,7 +1891,7 @@ func (t *HTTP1Transport) applyH1Spec(
 	// undo the capture.
 	if source == fingerprint.SourceClientHelloID {
 		fingerprint.ApplySignatureAlgorithms(spec.Extensions, t.preset.SignatureAlgorithms)
-		fingerprint.ApplyTrustAnchors(&spec.Extensions, t.preset.TrustAnchors)
+		fingerprint.ApplyTrustAnchors(&spec.Extensions, t.preset.TrustAnchors, utls.PermutesExtensions(t.preset.ClientHelloID))
 	}
 
 	conn := utls.UClient(rawConn, tlsConfig, utls.HelloCustom)

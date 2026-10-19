@@ -25,3 +25,11 @@ require (
 
 // Use local httpcloak (same repo)
 replace github.com/sardanioss/httpcloak => ../..
+
+// Local fork checkouts carrying the Chrome-parity fixes, as in the root go.mod.
+// Drop these once the forks are tagged.
+replace (
+	github.com/sardanioss/net => ../../../httpcloak-forks/net
+	github.com/sardanioss/quic-go => ../../../httpcloak-forks/quic-go
+	github.com/sardanioss/utls => ../../../httpcloak-forks/utls
+)

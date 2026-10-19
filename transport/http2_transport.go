@@ -411,6 +411,18 @@ func (t *HTTP2Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 	return resp, nil
 }
 
+// isHTTP2StreamError reports whether an HTTP/2 attempt failed on its stream (a
+// reset from the server, or a stream-level protocol error) rather than on the
+// connection. The host spoke HTTP/2, so the request is not sent again on a new
+// HTTP/1.1 connection: Chrome fails it, and moves to HTTP/1.1 only when the
+// reset asks for it with HTTP_1_1_REQUIRED. The fallback also hid the reset
+// behind the HTTP/1.1 attempt's own error, and an anti-bot edge answers a
+// refused request with RST_STREAM(INTERNAL_ERROR).
+func isHTTP2StreamError(err error) bool {
+	var se http2.StreamError
+	return errors.As(err, &se) && se.Code != http2.ErrCodeHTTP11Required
+}
+
 // getOrCreateConn gets an existing connection or creates a new one.
 // The TCP+TLS dial is performed outside the lock to avoid blocking all
 // hosts while one host is connecting (head-of-line blocking).
@@ -765,7 +777,7 @@ func (t *HTTP2Transport) establishConn(ctx context.Context, host, port string, s
 	// the client's real list, so overwriting it there would undo the capture.
 	if specSource == fingerprint.SourceClientHelloID {
 		fingerprint.ApplySignatureAlgorithms(specToUse.Extensions, t.preset.SignatureAlgorithms)
-		fingerprint.ApplyTrustAnchors(&specToUse.Extensions, t.preset.TrustAnchors)
+		fingerprint.ApplyTrustAnchors(&specToUse.Extensions, t.preset.TrustAnchors, utls.PermutesExtensions(t.preset.ClientHelloID))
 	}
 
 	// Fetch ECH config if needed. skipECH forces a no-ECH handshake, used by the
@@ -818,6 +830,10 @@ func (t *HTTP2Transport) establishConn(ctx context.Context, host, port string, s
 		PreferSkipResumptionOnNilExtension: true,          // Skip resumption if spec has no PSK extension instead of panicking
 		EncryptedClientHelloConfigList:     echConfigList, // ECH configuration (if available)
 		KeyLogWriter:                       keyLogWriter,
+		TicketAgeWholeSeconds:              t.preset.TLSTicketAgeWholeSeconds(),
+		OmitCloseNotify:                    t.preset.TLSOmitCloseNotify(),
+		DeferKeyUpdateReply:                t.preset.TLSDeferKeyUpdateReply(),
+		FalseStart:                         t.preset.TLSFalseStart(),
 	}
 	t.tlsVerify.Apply(tlsConfig)
 
@@ -897,7 +913,7 @@ func (t *HTTP2Transport) establishConn(ctx context.Context, host, port string, s
 			// Keep the same TCP signature_algorithms override on the fallback spec.
 			if fallbackJA3 == "" && fallbackSpec != nil {
 				fingerprint.ApplySignatureAlgorithms(fallbackSpec.Extensions, t.preset.SignatureAlgorithms)
-				fingerprint.ApplyTrustAnchors(&fallbackSpec.Extensions, t.preset.TrustAnchors)
+				fingerprint.ApplyTrustAnchors(&fallbackSpec.Extensions, t.preset.TrustAnchors, utls.PermutesExtensions(t.preset.ClientHelloID))
 			}
 
 			// Redo TLS handshake on the clean connection
