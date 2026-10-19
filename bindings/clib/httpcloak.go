@@ -3,6 +3,8 @@ package main
 /*
 // hop_windows.c takes over crosscall2 so no export runs Go code on the caller's thread.
 #cgo windows LDFLAGS: -Wl,--wrap=crosscall2
+// callback_pool.c's _Thread_local needs emutls from libgcc and winpthread; link both in rather than ship their DLLs.
+#cgo windows LDFLAGS: -static
 
 #include <stdlib.h>
 #include <stdint.h>
