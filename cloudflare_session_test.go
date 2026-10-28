@@ -212,8 +212,7 @@ func formStep(site, body string) cloudflare.Step {
 		URL:    site + "/form",
 		Headers: [][]string{{"content-length", strconv.Itoa(len(body))}, {"content-type", "application/x-www-form-urlencoded"},
 			{"user-agent", "solve-ua"}, {"cookie", ""}},
-		Body:          &body,
-		DeleteCookies: []string{"cf_chl_rc_m"},
+		Body: &body,
 	}
 }
 
@@ -277,9 +276,6 @@ func TestCloudflareClearsTheChallengeAndSendsTheRequestAgain(t *testing.T) {
 	form := site.received("/form")
 	if len(form) != 1 || form[0].body != "md=answer" {
 		t.Fatalf("form requests %+v", form)
-	}
-	if strings.Contains(form[0].header.Get("Cookie"), "cf_chl_rc_m") {
-		t.Errorf("cf_chl_rc_m went out on the form after the step said to delete it: %q", form[0].header.Get("Cookie"))
 	}
 
 	pages := site.received("/")

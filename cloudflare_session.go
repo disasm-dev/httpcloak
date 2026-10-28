@@ -200,16 +200,3 @@ func (b cloudflareBrowser) Send(ctx context.Context, step *cloudflare.Step) (*cl
 	}
 	return reply, nil
 }
-
-func (b cloudflareBrowser) DeleteCookie(target *url.URL, name string) {
-	host := strings.ToLower(target.Hostname())
-	for _, c := range b.s.inner.GetCookies() {
-		if c.Name != name {
-			continue
-		}
-		domain := strings.TrimPrefix(strings.ToLower(c.Domain), ".")
-		if host == domain || strings.HasSuffix(host, "."+domain) {
-			b.s.inner.DeleteCookie(name, c.Domain)
-		}
-	}
-}

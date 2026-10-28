@@ -22,16 +22,14 @@ const DefaultServiceURL = "https://cf.antibotapi.com"
 // the cookie one left empty for the session to fill from its jar. It is held
 // WaitMs before going out, because Cloudflare refuses an answer that arrives
 // sooner than the time it claims to have taken, and given up after TimeoutMs
-// (0: no limit), which the service is told as status 0. DeleteCookies names the
-// cookies to drop from the jar before it is sent.
+// (0: no limit), which the service is told as status 0.
 type Step struct {
-	Method        string     `json:"method"`
-	URL           string     `json:"url"`
-	Headers       [][]string `json:"headers"`
-	Body          *string    `json:"body,omitempty"`
-	WaitMs        int        `json:"wait_ms"`
-	TimeoutMs     int        `json:"timeout_ms"`
-	DeleteCookies []string   `json:"delete_cookies,omitempty"`
+	Method    string     `json:"method"`
+	URL       string     `json:"url"`
+	Headers   [][]string `json:"headers"`
+	Body      *string    `json:"body,omitempty"`
+	WaitMs    int        `json:"wait_ms"`
+	TimeoutMs int        `json:"timeout_ms"`
 }
 
 // Reply is what came of a Step: the status (0 when it was given up at its

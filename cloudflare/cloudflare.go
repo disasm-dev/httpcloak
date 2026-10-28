@@ -70,10 +70,6 @@ type Browser interface {
 	// the jar, without following a redirect, and returns what came back. It
 	// stops when ctx is done.
 	Send(ctx context.Context, step *Step) (*Reply, error)
-
-	// DeleteCookie drops the named cookie from every jar entry that would be
-	// sent to target.
-	DeleteCookie(target *url.URL, name string)
 }
 
 // Solver clears the challenges one session runs into. Clears of one host run
@@ -232,14 +228,10 @@ func (s *Solver) solve(ctx context.Context, page *url.URL, html []byte, userAgen
 	}
 }
 
-// send sends one step: the cookies it drops are dropped, it is held until its
-// moment, and a step given up at its timeout answers status 0, as the page's
-// own sender reports one that went unanswered.
+// send sends one step: it is held until its moment, and a step given up at its
+// timeout answers status 0, as the page's own sender reports one that went
+// unanswered.
 func (s *Solver) send(ctx context.Context, step *Step) (*Reply, error) {
-	target, err := url.Parse(step.URL)
-	if err != nil {
-		return nil, err
-	}
 	if step.WaitMs > 0 {
 		wait := time.NewTimer(time.Duration(step.WaitMs) * time.Millisecond)
 		select {
@@ -248,9 +240,6 @@ func (s *Solver) send(ctx context.Context, step *Step) (*Reply, error) {
 			return nil, ctx.Err()
 		case <-wait.C:
 		}
-	}
-	for _, name := range step.DeleteCookies {
-		s.browser.DeleteCookie(target, name)
 	}
 	sendCtx := ctx
 	if step.TimeoutMs > 0 {
