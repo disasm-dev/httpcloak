@@ -15,7 +15,6 @@ require (
 	github.com/miekg/dns v1.1.69
 	github.com/sardanioss/http v1.2.0
 	github.com/sardanioss/net v1.2.12
-	github.com/sardanioss/qpack v0.6.3
 	github.com/sardanioss/quic-go v1.2.30
 	github.com/sardanioss/udpbara v1.1.0
 	github.com/sardanioss/utls v1.10.5
@@ -24,6 +23,7 @@ require (
 )
 
 require (
+	github.com/sardanioss/qpack v0.6.3 // indirect
 	golang.org/x/crypto v0.46.0 // indirect
 	golang.org/x/mod v0.30.0 // indirect
 	golang.org/x/sys v0.39.0 // indirect
@@ -31,10 +31,11 @@ require (
 	golang.org/x/tools v0.39.0 // indirect
 )
 
-// Local fork checkouts carrying the Chrome-parity fixes. Drop these once the
-// forks are tagged and the requires above point at the new versions.
+// disasm-dev's forks carrying the Chrome-parity fixes. A replace only holds in
+// the module that declares it, so a project using this fork needs the same
+// three in its own go.mod (see README).
 replace (
-	github.com/sardanioss/net => ../httpcloak-forks/net
-	github.com/sardanioss/quic-go => ../httpcloak-forks/quic-go
-	github.com/sardanioss/utls => ../httpcloak-forks/utls
+	github.com/sardanioss/net => github.com/disasm-dev/net v1.2.1200
+	github.com/sardanioss/quic-go => github.com/disasm-dev/quic-go v1.2.3000
+	github.com/sardanioss/utls => github.com/disasm-dev/utls v1.10.500
 )

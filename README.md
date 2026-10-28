@@ -21,6 +21,36 @@
 
 ---
 
+## This fork
+
+disasm-dev/httpcloak is [sardanioss/httpcloak](https://github.com/sardanioss/httpcloak) plus:
+
+- **Cloudflare challenges cleared for you.** `WithCloudflare(apiKey)` hands a challenge page to the [cf.antibotapi.com](https://cf.antibotapi.com) solve service, sends the requests it answers with through the session itself (its own TLS fingerprint, connection and cookie jar), then sends your request again, all inside the one call.
+- **Chrome-parity fixes** in httpcloak and in its net, quic-go and utls dependencies, which come from [disasm-dev/net](https://github.com/disasm-dev/net), [disasm-dev/quic-go](https://github.com/disasm-dev/quic-go) and [disasm-dev/utls](https://github.com/disasm-dev/utls).
+
+### Use it from Go
+
+Keep importing `github.com/sardanioss/httpcloak` and point it and its three dependencies at the forks:
+
+```bash
+go mod edit \
+  -replace=github.com/sardanioss/httpcloak=github.com/disasm-dev/httpcloak@v1.7.300 \
+  -replace=github.com/sardanioss/net=github.com/disasm-dev/net@v1.2.1200 \
+  -replace=github.com/sardanioss/quic-go=github.com/disasm-dev/quic-go@v1.2.3000 \
+  -replace=github.com/sardanioss/utls=github.com/disasm-dev/utls@v1.10.500
+go mod tidy
+```
+
+```go
+s := httpcloak.NewSession("chrome-latest-windows", httpcloak.WithCloudflare("<cf.antibotapi.com key>"))
+defer s.Close()
+resp, err := s.Get(context.Background(), "https://a-site-behind-cloudflare.example")
+```
+
+`v1.7.300` is upstream v1.7.3 plus these changes; `v1.7.301` on are further releases on that base, and `v1.7.400` follows upstream v1.7.4. The Python, Node and .NET packages of the fork are not published yet.
+
+---
+
 ## The Problem
 
 Bot detection doesn't just check your User-Agent anymore.
