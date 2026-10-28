@@ -40,6 +40,7 @@ import (
 	"time"
 
 	"github.com/sardanioss/httpcloak/client"
+	"github.com/sardanioss/httpcloak/cloudflare"
 	"github.com/sardanioss/httpcloak/fingerprint"
 	"github.com/sardanioss/httpcloak/protocol"
 	"github.com/sardanioss/httpcloak/session"
@@ -593,6 +594,9 @@ func (c *Client) Close() {
 type Session struct {
 	inner     *session.Session
 	configErr error // deferred config error (e.g. invalid Akamai string)
+
+	cloudflare       *cloudflare.Solver // clears Cloudflare challenges (WithCloudflare)
+	cloudflareConfig *cloudflare.Config
 }
 
 // SessionOption configures a session
@@ -643,6 +647,8 @@ type sessionConfig struct {
 	customH2Settings     *fingerprint.HTTP2Settings
 	customPseudoOrder    []string
 	customTCPFingerprint *fingerprint.TCPFingerprint
+
+	cloudflare *cloudflare.Config // Cloudflare challenge clearing (WithCloudflare)
 
 	configErr error // deferred error from option parsing
 }
@@ -1195,7 +1201,9 @@ func NewSession(preset string, opts ...SessionOption) *Session {
 	if configErr == nil && cfg.preset != "" && fingerprint.GetStrict(cfg.preset) == nil {
 		configErr = fingerprint.UnknownPresetError(cfg.preset)
 	}
-	return &Session{inner: s, configErr: configErr}
+	sess := &Session{inner: s, configErr: configErr}
+	sess.enableCloudflare(cfg.cloudflare)
+	return sess
 }
 
 // toResponse converts a transport response, including its redirect history.
@@ -1246,6 +1254,9 @@ func (s *Session) Do(ctx context.Context, req *Request) (*Response, error) {
 	if s.configErr != nil {
 		return nil, s.configErr
 	}
+	if s.cloudflare != nil && !clearingChallenges(ctx) {
+		return s.doClearing(ctx, req)
+	}
 	sReq := &transport.Request{
 		Method:                        req.Method,
 		URL:                           req.URL,
@@ -1279,6 +1290,11 @@ func (s *Session) Do(ctx context.Context, req *Request) (*Response, error) {
 func (s *Session) DoWithBody(ctx context.Context, req *Request, bodyReader io.Reader) (*Response, error) {
 	if s.configErr != nil {
 		return nil, s.configErr
+	}
+	if s.cloudflare != nil && !clearingChallenges(ctx) {
+		withBody := *req
+		withBody.Body = bodyReader
+		return s.doClearing(ctx, &withBody)
 	}
 	sReq := &transport.Request{
 		Method:                        req.Method,
@@ -1521,6 +1537,7 @@ func (s *Session) Fork(n int) []*Session {
 	forks := make([]*Session, len(innerForks))
 	for i, inner := range innerForks {
 		forks[i] = &Session{inner: inner}
+		forks[i].enableCloudflare(s.cloudflareConfig)
 	}
 	return forks
 }

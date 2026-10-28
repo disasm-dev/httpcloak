@@ -1671,6 +1671,9 @@ class Session {
       tcpWindowSize = null,
       tcpWindowScale = null,
       tcpDf = null,
+      cloudflareApiKey = null,
+      cloudflareJwtSecret = null,
+      cloudflareServiceUrl = null,
     } = options;
 
     this._lib = getLib();
@@ -1780,6 +1783,15 @@ class Session {
     }
     if (tcpDf != null) {
       config.tcp_df = tcpDf;
+    }
+    if (cloudflareApiKey) {
+      config.cloudflare_api_key = cloudflareApiKey;
+    }
+    if (cloudflareJwtSecret) {
+      config.cloudflare_jwt_secret = cloudflareJwtSecret;
+    }
+    if (cloudflareServiceUrl) {
+      config.cloudflare_service_url = cloudflareServiceUrl;
     }
 
     // The library hands a session the cache configured when it is created and

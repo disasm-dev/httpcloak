@@ -296,6 +296,16 @@ export interface SessionOptions {
   tcpWindowScale?: number;
   /** IP Don't-Fragment flag. true on every modern client. */
   tcpDf?: boolean;
+  /**
+   * cf.antibotapi.com API key. When set, a response that is a Cloudflare challenge is solved through the
+   * service and the request sent again, inside the one call; cf_clearance stays in the session's cookies.
+   * The preset must send a User-Agent the service has a device for (chrome-latest-windows does).
+   */
+  cloudflareApiKey?: string;
+  /** The Cloudflare key's JWT secret, for a key with JWT on. */
+  cloudflareJwtSecret?: string;
+  /** Solve service address (default: https://cf.antibotapi.com). */
+  cloudflareServiceUrl?: string;
 }
 
 export interface RequestOptions {

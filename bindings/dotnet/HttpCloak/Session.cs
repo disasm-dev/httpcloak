@@ -232,6 +232,9 @@ public sealed class Session : IDisposable
     /// <param name="tcpWindowSize">TCP Window Size override: 64240=Windows, 65535=Linux/macOS (default: null)</param>
     /// <param name="tcpWindowScale">TCP Window Scale override: 8=Windows, 7=Linux, 6=macOS (default: null)</param>
     /// <param name="tcpDf">IP Don't Fragment bit override (default: null)</param>
+    /// <param name="cloudflareApiKey">cf.antibotapi.com API key. When set, a response that is a Cloudflare challenge is solved through the service and the request sent again, inside the one call; cf_clearance stays in the session's cookies. The preset must send a User-Agent the service has a device for (chrome-latest-windows does) (default: null, off)</param>
+    /// <param name="cloudflareJwtSecret">The Cloudflare key's JWT secret, for a key with JWT on (default: null)</param>
+    /// <param name="cloudflareServiceUrl">Solve service address (default: null, https://cf.antibotapi.com)</param>
     public Session(
         string preset = "chrome-latest",
         string? proxy = null,
@@ -269,7 +272,10 @@ public sealed class Session : IDisposable
         int? tcpMss = null,
         int? tcpWindowSize = null,
         int? tcpWindowScale = null,
-        bool? tcpDf = null)
+        bool? tcpDf = null,
+        string? cloudflareApiKey = null,
+        string? cloudflareJwtSecret = null,
+        string? cloudflareServiceUrl = null)
     {
         Auth = auth;
 
@@ -310,7 +316,10 @@ public sealed class Session : IDisposable
             TcpMss = tcpMss,
             TcpWindowSize = tcpWindowSize,
             TcpWindowScale = tcpWindowScale,
-            TcpDf = tcpDf
+            TcpDf = tcpDf,
+            CloudflareApiKey = cloudflareApiKey,
+            CloudflareJwtSecret = cloudflareJwtSecret,
+            CloudflareServiceUrl = cloudflareServiceUrl
         };
 
         string configJson = JsonSerializer.Serialize(config, JsonContext.Relaxed.SessionConfig);
@@ -2475,6 +2484,12 @@ public sealed class Session : IDisposable
     // the old shape too. PublicApiTests guards that.
     // ------------------------------------------------------------------
 
+    // The constructor as it stood before the cloudflare* parameters.
+    public Session(string preset, string? proxy, string? tcpProxy, string? udpProxy, int timeout, string httpVersion, bool verify, bool allowRedirects, int maxRedirects, int retry, int[]? retryOnStatus, int retryWaitMin, int retryWaitMax, bool preferIpv4, (string Username, string Password)? auth, Dictionary<string, string>? connectTo, string? echConfigDomain, bool tlsOnly, int quicIdleTimeout, string? localAddress, string? keyLogFile, bool enableSpeculativeTls, string? switchProtocol, bool withoutCookieJar, bool withoutConditionalCache, bool withoutClientHints, bool withoutHighEntropyClientHints, bool disableEch, bool disableHttp3, string? ja3, string? akamai, Dictionary<string, object>? extraFp, int? tcpTtl, int? tcpMss, int? tcpWindowSize, int? tcpWindowScale, bool? tcpDf)
+        : this(preset, proxy, tcpProxy, udpProxy, timeout, httpVersion, verify, allowRedirects, maxRedirects, retry, retryOnStatus, retryWaitMin, retryWaitMax, preferIpv4, auth, connectTo, echConfigDomain, tlsOnly, quicIdleTimeout, localAddress, keyLogFile, enableSpeculativeTls, switchProtocol, withoutCookieJar, withoutConditionalCache, withoutClientHints, withoutHighEntropyClientHints, disableEch, disableHttp3, ja3, akamai, extraFp, tcpTtl, tcpMss, tcpWindowSize, tcpWindowScale, tcpDf, cloudflareApiKey: null, cloudflareJwtSecret: null, cloudflareServiceUrl: null)
+    {
+    }
+
     public Response Get(string url, Dictionary<string, string>? headers, IEnumerable<KeyValuePair<string, string>>? parameters, Dictionary<string, string>? cookies, (string, string)? auth, int? timeout, string? fetchMode, bool? allowRedirects, bool disableConditionalCache, bool disableClientHints, bool disableHighEntropyClientHints)
         => Get(url, headers, parameters, cookies, auth, timeout, fetchMode, allowRedirects, disableConditionalCache, disableClientHints, disableHighEntropyClientHints, disableRedirectReferer: false, exactHeaders: null);
 
@@ -3911,6 +3926,18 @@ internal class SessionConfig
     [JsonPropertyName("tcp_df")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public bool? TcpDf { get; set; }
+
+    [JsonPropertyName("cloudflare_api_key")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? CloudflareApiKey { get; set; }
+
+    [JsonPropertyName("cloudflare_jwt_secret")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? CloudflareJwtSecret { get; set; }
+
+    [JsonPropertyName("cloudflare_service_url")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? CloudflareServiceUrl { get; set; }
 }
 
 internal class RequestConfig

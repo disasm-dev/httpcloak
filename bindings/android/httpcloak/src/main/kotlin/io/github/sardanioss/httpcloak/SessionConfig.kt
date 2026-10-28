@@ -73,6 +73,16 @@ public data class SessionConfig @JvmOverloads constructor(
     public val tcpWindowScale: Int? = null,
     /** IP Don't Fragment bit. */
     public val tcpDf: Boolean? = null,
+    /**
+     * cf.antibotapi.com API key. When set, a response that is a Cloudflare challenge is solved
+     * through the service and the request sent again, inside the one call; cf_clearance stays in
+     * the session's cookies. The preset must send a User-Agent the service has a device for.
+     */
+    public val cloudflareApiKey: String? = null,
+    /** The Cloudflare key's JWT secret, for a key with JWT on. */
+    public val cloudflareJwtSecret: String? = null,
+    /** Solve service address (library default https://cf.antibotapi.com). */
+    public val cloudflareServiceUrl: String? = null,
 ) {
     internal fun toJson(): String {
         val json = JSONObject()
@@ -119,6 +129,9 @@ public data class SessionConfig @JvmOverloads constructor(
         put("tcp_window_size", tcpWindowSize)
         put("tcp_window_scale", tcpWindowScale)
         put("tcp_df", tcpDf)
+        put("cloudflare_api_key", cloudflareApiKey)
+        put("cloudflare_jwt_secret", cloudflareJwtSecret)
+        put("cloudflare_service_url", cloudflareServiceUrl)
         return json.toString()
     }
 }

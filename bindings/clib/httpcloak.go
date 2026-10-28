@@ -29,6 +29,7 @@ import (
 	"unsafe"
 
 	"github.com/sardanioss/httpcloak"
+	"github.com/sardanioss/httpcloak/cloudflare"
 	"github.com/sardanioss/httpcloak/dns"
 	"github.com/sardanioss/httpcloak/fingerprint"
 	"github.com/sardanioss/httpcloak/protocol"
@@ -327,6 +328,9 @@ type SessionConfig struct {
 	TCPWindowSize                 *int                   `json:"tcp_window_size,omitempty"`                   // Override TCP window size (64240=Windows, 65535=Linux)
 	TCPWindowScale                *int                   `json:"tcp_window_scale,omitempty"`                  // Override TCP window scale (8=Win, 7=Linux, 6=macOS)
 	TCPDFBit                      *bool                  `json:"tcp_df,omitempty"`                            // Override IP Don't Fragment flag
+	CloudflareAPIKey              string                 `json:"cloudflare_api_key,omitempty"`                // cf.antibotapi.com key: clear Cloudflare challenges (WithCloudflare)
+	CloudflareJWTSecret           string                 `json:"cloudflare_jwt_secret,omitempty"`             // The key's JWT secret, for a key with JWT on
+	CloudflareServiceURL          string                 `json:"cloudflare_service_url,omitempty"`            // Solve service address (default https://cf.antibotapi.com)
 }
 
 // Error response
@@ -1340,6 +1344,14 @@ func httpcloak_session_new(configJSON *C.char) (hcRet C.int64_t) {
 	backend, errorCallback := getSessionCacheBackend()
 	if backend != nil {
 		opts = append(opts, httpcloak.WithSessionCache(backend, errorCallback))
+	}
+
+	if config.CloudflareAPIKey != "" {
+		opts = append(opts, httpcloak.WithCloudflareConfig(cloudflare.Config{
+			APIKey:     config.CloudflareAPIKey,
+			JWTSecret:  config.CloudflareJWTSecret,
+			ServiceURL: config.CloudflareServiceURL,
+		}))
 	}
 
 	session := httpcloak.NewSession(config.Preset, opts...)

@@ -1811,6 +1811,12 @@ class Session:
         enable_speculative_tls: Enable speculative TLS optimization for proxy connections (default: False).
             When True, CONNECT and TLS ClientHello are sent together saving one round-trip.
             May cause issues with certain proxies or debugging tools.
+        cloudflare_api_key: cf.antibotapi.com API key. When set, a response that is a Cloudflare
+            challenge is solved through the service and the request sent again, inside the one call;
+            cf_clearance stays in the session's cookies. The preset must send a User-Agent the service
+            has a device for (chrome-latest-windows does).
+        cloudflare_jwt_secret: The key's JWT secret, for a key with JWT on
+        cloudflare_service_url: Solve service address (default: https://cf.antibotapi.com)
 
     Example:
         with httpcloak.Session(preset="chrome-143") as session:
@@ -1878,6 +1884,9 @@ class Session:
         tcp_window_size: Optional[int] = None,
         tcp_window_scale: Optional[int] = None,
         tcp_df: Optional[bool] = None,
+        cloudflare_api_key: Optional[str] = None,
+        cloudflare_jwt_secret: Optional[str] = None,
+        cloudflare_service_url: Optional[str] = None,
     ):
         self._lib = _get_lib()
         self._default_timeout = timeout
@@ -1951,6 +1960,12 @@ class Session:
             config["tcp_window_scale"] = tcp_window_scale
         if tcp_df is not None:
             config["tcp_df"] = tcp_df
+        if cloudflare_api_key:
+            config["cloudflare_api_key"] = cloudflare_api_key
+        if cloudflare_jwt_secret:
+            config["cloudflare_jwt_secret"] = cloudflare_jwt_secret
+        if cloudflare_service_url:
+            config["cloudflare_service_url"] = cloudflare_service_url
 
         config_json = json.dumps(config).encode("utf-8")
         self._handle = self._lib.httpcloak_session_new(config_json)
