@@ -1416,6 +1416,27 @@ func (t *HTTP1Transport) writeHeadersInOrder(w *bufio.Writer, req *http.Request,
 				// Skip Content-Length when using chunked encoding
 				continue
 			}
+			// Exact mode stores the caller's pair under the caller's casing,
+			// which the canonical lookup below misses: the slot wrote a
+			// Content-Length of its own and the remainder loop sent the
+			// caller's pair again, two lengths on one request. The pair keeps
+			// its name and slot and carries the body's real length, as HTTP/2
+			// and HTTP/3 send it, because a listed value that disagreed with
+			// the body would desync the framing.
+			if exact {
+				if mapKey, ok := resolveHeaderKey(req.Header, key); ok {
+					wire := h1WireHeaderName(mapKey)
+					if mapKey != canonicalHeaderKey(mapKey) {
+						wire = mapKey
+					}
+					if req.ContentLength > 0 || (req.ContentLength == 0 && req.Body != nil) {
+						fmt.Fprintf(w, "%s: %d\r\n", wire, req.ContentLength)
+					}
+					written[mapKey] = true
+					written[canonicalKey] = true
+					continue
+				}
+			}
 			// First check if header is set
 			if values, ok := req.Header[canonicalKey]; ok {
 				for _, v := range values {

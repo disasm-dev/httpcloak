@@ -3,6 +3,7 @@ package transport
 import (
 	"bufio"
 	"bytes"
+	"strings"
 	"testing"
 
 	http "github.com/sardanioss/http"
@@ -176,6 +177,31 @@ func TestExactHeadersShortCircuitIsWired(t *testing.T) {
 // HttpURLConnection sends User-Agent, Host, Connection, Accept-Encoding. In
 // exact mode a listed Host or Connection keeps its slot; an unlisted Host is
 // still written first, since the request cannot go out without one.
+// A listed content-length went out twice on HTTP/1.1: once as Content-Length
+// from the body, once as the caller's own pair from the remainder. It goes out
+// once, under the listed name at the listed slot, with the body's length.
+func TestExactHeadersSendOneContentLength(t *testing.T) {
+	body := "md=answer"
+	req, _ := http.NewRequest("POST", "https://example.com/form", strings.NewReader(body))
+	applyExactHeaders(req, []fingerprint.HeaderPair{
+		hp("content-length", "0"),
+		hp("content-type", "application/x-www-form-urlencoded"),
+		hp("user-agent", "mirror"),
+	}, nil, nil, "h1")
+	var buf bytes.Buffer
+	conn := &http1Conn{bw: bufio.NewWriter(&buf)}
+	if err := (&HTTP1Transport{}).writeRequest(conn, req); err != nil {
+		t.Fatalf("writeRequest: %v", err)
+	}
+	want := "POST /form HTTP/1.1\r\nHost: example.com\r\n" +
+		"content-length: 9\r\n" +
+		"content-type: application/x-www-form-urlencoded\r\n" +
+		"user-agent: mirror\r\n\r\n" + body
+	if got := buf.String(); got != want {
+		t.Errorf("\n got: %q\nwant: %q", got, want)
+	}
+}
+
 func TestExactHeadersKeepHostAndConnectionSlots(t *testing.T) {
 	write := func(t *testing.T, exact []fingerprint.HeaderPair) string {
 		t.Helper()
