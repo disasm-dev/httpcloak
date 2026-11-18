@@ -35,7 +35,7 @@ require (
 // the module that declares it, so a project using this fork needs the same
 // three in its own go.mod (see README).
 replace (
-	github.com/sardanioss/net => ../httpcloak-forks/net
-	github.com/sardanioss/quic-go => ../httpcloak-forks/quic-go
+	github.com/sardanioss/net => github.com/disasm-dev/net v1.2.1400
+	github.com/sardanioss/quic-go => github.com/disasm-dev/quic-go v1.2.3100
 	github.com/sardanioss/utls => github.com/disasm-dev/utls v1.10.500
 )
