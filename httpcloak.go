@@ -41,6 +41,7 @@ import (
 
 	"github.com/sardanioss/httpcloak/client"
 	"github.com/sardanioss/httpcloak/cloudflare"
+	"github.com/sardanioss/httpcloak/datadome"
 	"github.com/sardanioss/httpcloak/fingerprint"
 	"github.com/sardanioss/httpcloak/protocol"
 	"github.com/sardanioss/httpcloak/session"
@@ -328,6 +329,11 @@ type Request struct {
 	// it never fires there. It runs on the calling goroutine between hops, so it
 	// must not block and must not re-enter the same session.
 	OnRedirect func(*Redirect) error
+
+	// omitHeaders are preset headers this request goes out without. Only the
+	// challenge handling sets it, to send a request again as the reload a
+	// script started (no Sec-Fetch-User).
+	omitHeaders []string
 }
 
 // RedirectInfo contains information about a redirect response
@@ -597,6 +603,9 @@ type Session struct {
 
 	cloudflare       *cloudflare.Solver // clears Cloudflare challenges (WithCloudflare)
 	cloudflareConfig *cloudflare.Config
+
+	datadome       *datadome.Solver // answers DataDome blocks (WithDatadome)
+	datadomeConfig *datadome.Config
 }
 
 // SessionOption configures a session
@@ -649,6 +658,7 @@ type sessionConfig struct {
 	customTCPFingerprint *fingerprint.TCPFingerprint
 
 	cloudflare *cloudflare.Config // Cloudflare challenge clearing (WithCloudflare)
+	datadome   *datadome.Config   // DataDome block solving (WithDatadome)
 
 	configErr error // deferred error from option parsing
 }
@@ -1203,6 +1213,7 @@ func NewSession(preset string, opts ...SessionOption) *Session {
 	}
 	sess := &Session{inner: s, configErr: configErr}
 	sess.enableCloudflare(cfg.cloudflare)
+	sess.enableDatadome(cfg.datadome)
 	return sess
 }
 
@@ -1254,7 +1265,7 @@ func (s *Session) Do(ctx context.Context, req *Request) (*Response, error) {
 	if s.configErr != nil {
 		return nil, s.configErr
 	}
-	if s.cloudflare != nil && !clearingChallenges(ctx) {
+	if s.clearsChallenges() && !clearingChallenges(ctx) {
 		return s.doClearing(ctx, req)
 	}
 	sReq := &transport.Request{
@@ -1270,6 +1281,7 @@ func (s *Session) Do(ctx context.Context, req *Request) (*Response, error) {
 		DisableClientHints:            req.DisableClientHints,
 		DisableHighEntropyClientHints: req.DisableHighEntropyClientHints,
 		DisableRedirectReferer:        req.DisableRedirectReferer,
+		OmitHeaders:                   req.omitHeaders,
 		HeaderOrder:                   req.HeaderOrder,
 		OnRedirect:                    req.OnRedirect,
 		Timeout:                       req.Timeout,
@@ -1291,7 +1303,7 @@ func (s *Session) DoWithBody(ctx context.Context, req *Request, bodyReader io.Re
 	if s.configErr != nil {
 		return nil, s.configErr
 	}
-	if s.cloudflare != nil && !clearingChallenges(ctx) {
+	if s.clearsChallenges() && !clearingChallenges(ctx) {
 		withBody := *req
 		withBody.Body = bodyReader
 		return s.doClearing(ctx, &withBody)
@@ -1309,6 +1321,7 @@ func (s *Session) DoWithBody(ctx context.Context, req *Request, bodyReader io.Re
 		DisableClientHints:            req.DisableClientHints,
 		DisableHighEntropyClientHints: req.DisableHighEntropyClientHints,
 		DisableRedirectReferer:        req.DisableRedirectReferer,
+		OmitHeaders:                   req.omitHeaders,
 		HeaderOrder:                   req.HeaderOrder,
 		OnRedirect:                    req.OnRedirect,
 		Timeout:                       req.Timeout,
@@ -1538,6 +1551,7 @@ func (s *Session) Fork(n int) []*Session {
 	for i, inner := range innerForks {
 		forks[i] = &Session{inner: inner}
 		forks[i].enableCloudflare(s.cloudflareConfig)
+		forks[i].enableDatadome(s.datadomeConfig)
 	}
 	return forks
 }

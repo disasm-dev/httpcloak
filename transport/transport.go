@@ -293,6 +293,14 @@ type Request struct {
 	// carrying that one forward would leak the pre-redirect URL to the new host.
 	DisableRedirectReferer bool
 
+	// OmitHeaders names preset headers this request goes out without, matched
+	// case-insensitively, after the preset block and the caller's Headers are
+	// merged. It is how a request built from the preset drops a header the
+	// browser leaves off in one situation, such as Sec-Fetch-User on a reload
+	// a script started. Ignored under ExactHeaders, which lists every header
+	// already.
+	OmitHeaders []string
+
 	// HeaderOrder, when non-empty, is the header order for THIS request only and
 	// fully replaces any order installed session-wide with SetHeaderOrder. It is
 	// read from the request, never from shared state, so concurrent requests can
@@ -2962,6 +2970,7 @@ func mergeCallerHeaders(httpReq *http.Request, req *Request) {
 	if len(req.ExactHeaders) > 0 {
 		return
 	}
+	defer omitHeaders(httpReq, req.OmitHeaders)
 	if len(req.Headers) == 0 {
 		return
 	}
@@ -2981,6 +2990,24 @@ func mergeCallerHeaders(httpReq *http.Request, req *Request) {
 		backing = append(backing, values...)
 		httpReq.Header[canonicalHeaderName(key)] = backing[start:len(backing):len(backing)]
 	}
+}
+
+// omitHeaders drops the named headers, under any casing, from the merged set.
+func omitHeaders(httpReq *http.Request, names []string) {
+	for _, name := range names {
+		for key := range httpReq.Header {
+			if strings.EqualFold(key, name) {
+				delete(httpReq.Header, key)
+			}
+		}
+	}
+}
+
+// IsNavigation reports whether a request built from the preset goes out as a
+// top-level navigation (Sec-Fetch-Mode: navigate) rather than as a fetch/XHR,
+// by the same reading of its method and headers the preset pipeline makes.
+func IsNavigation(method string, headers map[string][]string) bool {
+	return !sniffXHRMode(method, headers)
 }
 
 // wireHeaderPair is one preset header ready to write: the key is already in

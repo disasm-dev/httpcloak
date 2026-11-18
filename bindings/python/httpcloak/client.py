@@ -1817,6 +1817,13 @@ class Session:
             has a device for (chrome-latest-windows does).
         cloudflare_jwt_secret: The key's JWT secret, for a key with JWT on
         cloudflare_service_url: Solve service address (default: https://cf.antibotapi.com)
+        datadome_api_key: dd.antibotapi.com API key. When set, a response that is a DataDome block
+            (interstitial or slider captcha) is solved through the payload API and the request sent
+            again, inside the one call; the datadome cookie stays in the session's cookies. A hard
+            block (t=bv) raises once dropping the burned cookie does not clear it: change proxy.
+            The preset must be Chrome on Windows (chrome-latest-windows).
+        datadome_jwt_secret: The DataDome key's signing secret, for a key with signing on
+        datadome_service_url: Payload API address (default: https://dd.antibotapi.com)
 
     Example:
         with httpcloak.Session(preset="chrome-143") as session:
@@ -1887,6 +1894,9 @@ class Session:
         cloudflare_api_key: Optional[str] = None,
         cloudflare_jwt_secret: Optional[str] = None,
         cloudflare_service_url: Optional[str] = None,
+        datadome_api_key: Optional[str] = None,
+        datadome_jwt_secret: Optional[str] = None,
+        datadome_service_url: Optional[str] = None,
     ):
         self._lib = _get_lib()
         self._default_timeout = timeout
@@ -1966,6 +1976,12 @@ class Session:
             config["cloudflare_jwt_secret"] = cloudflare_jwt_secret
         if cloudflare_service_url:
             config["cloudflare_service_url"] = cloudflare_service_url
+        if datadome_api_key:
+            config["datadome_api_key"] = datadome_api_key
+        if datadome_jwt_secret:
+            config["datadome_jwt_secret"] = datadome_jwt_secret
+        if datadome_service_url:
+            config["datadome_service_url"] = datadome_service_url
 
         config_json = json.dumps(config).encode("utf-8")
         self._handle = self._lib.httpcloak_session_new(config_json)

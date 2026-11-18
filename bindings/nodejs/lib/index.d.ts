@@ -306,6 +306,17 @@ export interface SessionOptions {
   cloudflareJwtSecret?: string;
   /** Solve service address (default: https://cf.antibotapi.com). */
   cloudflareServiceUrl?: string;
+  /**
+   * dd.antibotapi.com API key. When set, a response that is a DataDome block (interstitial or slider
+   * captcha) is solved through the payload API and the request sent again, inside the one call; the
+   * datadome cookie stays in the session's cookies. A hard block (t=bv) fails once dropping the burned
+   * cookie does not clear it: change proxy. The preset must be Chrome on Windows (chrome-latest-windows).
+   */
+  datadomeApiKey?: string;
+  /** The DataDome key's signing secret, for a key with signing on. */
+  datadomeJwtSecret?: string;
+  /** Payload API address (default: https://dd.antibotapi.com). */
+  datadomeServiceUrl?: string;
 }
 
 export interface RequestOptions {

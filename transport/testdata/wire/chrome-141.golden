@@ -250,6 +250,7 @@ body "{\"k\":1}"
       ],
       "hpack_header_order": [
         "cache-control",
+        "sec-ch-device-memory",
         "sec-ch-ua",
         "sec-ch-ua-arch",
         "sec-ch-ua-bitness",
@@ -284,6 +285,7 @@ body "{\"k\":1}"
         "sec-ch-ua-platform",
         "sec-ch-ua-platform-version",
         "user-agent",
+        "sec-ch-device-memory",
         "sec-ch-ua",
         "sec-ch-ua-arch",
         "sec-ch-ua-bitness",

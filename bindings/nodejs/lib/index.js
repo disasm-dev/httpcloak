@@ -1674,6 +1674,9 @@ class Session {
       cloudflareApiKey = null,
       cloudflareJwtSecret = null,
       cloudflareServiceUrl = null,
+      datadomeApiKey = null,
+      datadomeJwtSecret = null,
+      datadomeServiceUrl = null,
     } = options;
 
     this._lib = getLib();
@@ -1792,6 +1795,15 @@ class Session {
     }
     if (cloudflareServiceUrl) {
       config.cloudflare_service_url = cloudflareServiceUrl;
+    }
+    if (datadomeApiKey) {
+      config.datadome_api_key = datadomeApiKey;
+    }
+    if (datadomeJwtSecret) {
+      config.datadome_jwt_secret = datadomeJwtSecret;
+    }
+    if (datadomeServiceUrl) {
+      config.datadome_service_url = datadomeServiceUrl;
     }
 
     // The library hands a session the cache configured when it is created and

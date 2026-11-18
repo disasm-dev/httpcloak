@@ -1,12 +1,9 @@
 package httpcloak
 
 import (
-	"bytes"
 	"context"
 	"errors"
-	"fmt"
 	"io"
-	"net/url"
 	"strings"
 
 	"github.com/sardanioss/httpcloak/cloudflare"
@@ -46,15 +43,6 @@ func WithCloudflareConfig(cfg cloudflare.Config) SessionOption {
 	}
 }
 
-// clearingKey marks a request the challenge handling sends itself, a solve's
-// step or a request going out again, so Do sends it as it stands.
-type clearingKey struct{}
-
-func clearingChallenges(ctx context.Context) bool {
-	marked, _ := ctx.Value(clearingKey{}).(bool)
-	return marked
-}
-
 func (s *Session) enableCloudflare(cfg *cloudflare.Config) {
 	if cfg == nil {
 		return
@@ -63,100 +51,17 @@ func (s *Session) enableCloudflare(cfg *cloudflare.Config) {
 	s.cloudflare = cloudflare.New(*cfg, cloudflareBrowser{s})
 }
 
-// doClearing is Do for a session that clears Cloudflare challenges: while the
-// response is a challenge page, the challenge is cleared and the request sent
-// again. A challenge that cannot be cleared comes back with the error saying
-// why.
-func (s *Session) doClearing(ctx context.Context, req *Request) (*Response, error) {
-	send := *req
-	rewind := replayable(&send)
-	marked := context.WithValue(ctx, clearingKey{}, true)
-
-	resp, err := s.Do(marked, &send)
-	for cleared := 0; err == nil; cleared++ {
-		html, challenged := challengePage(resp)
-		if !challenged {
-			return resp, nil
-		}
-		if cleared == s.cloudflare.MaxSolves() {
-			return resp, cloudflare.ErrStillChallenged
-		}
-		page := resp.FinalURL
-		if page == "" {
-			page = req.URL
-		}
-		pageURL, perr := url.Parse(page)
-		if perr != nil {
-			return resp, fmt.Errorf("cloudflare: %w", perr)
-		}
-		if cerr := s.cloudflare.Clear(ctx, pageURL, html, s.userAgent(req)); cerr != nil {
-			return resp, cerr
-		}
-		if rewind == nil {
-			return resp, fmt.Errorf("cloudflare: cleared, but the request cannot go out again: %w", ErrBodyNotReplayable)
-		}
-		if rerr := rewind(); rerr != nil {
-			return resp, fmt.Errorf("cloudflare: reopen request body: %w", rerr)
-		}
-		resp, err = s.Do(marked, &send)
-	}
-	return resp, err
-}
-
-// replayable makes req's body one that can go out again and returns what
-// rewinds it, or nil when it cannot. A body already in memory is read once and
-// served fresh each time; a stream re-opens from GetBody.
-func replayable(req *Request) func() error {
-	switch body := req.Body.(type) {
-	case nil:
-		return func() error { return nil }
-	case *bytes.Reader, *bytes.Buffer, *strings.Reader:
-		data, _ := io.ReadAll(body)
-		req.Body = bytes.NewReader(data)
-		return func() error {
-			req.Body = bytes.NewReader(data)
-			return nil
-		}
-	}
-	if req.GetBody == nil {
-		return nil
-	}
-	return func() error {
-		body, err := req.GetBody()
-		req.Body = body
-		return err
-	}
-}
-
 // challengePage returns resp's body when it is a challenge page, leaving it
 // readable for the caller either way.
 func challengePage(resp *Response) ([]byte, bool) {
 	if resp == nil || resp.Body == nil || !cloudflare.IsChallenge(resp.StatusCode, resp.Headers) {
 		return nil, false
 	}
-	body, err := io.ReadAll(resp.Body)
-	resp.Body.Close()
-	resp.Body = io.NopCloser(bytes.NewReader(body))
+	body, err := readBody(resp)
 	if err != nil {
 		return nil, false
 	}
 	return body, cloudflare.IsChallengePage(body)
-}
-
-// userAgent is the User-Agent req goes out with: one it sets itself, else the
-// preset's.
-func (s *Session) userAgent(req *Request) string {
-	for _, h := range req.ExactHeaders {
-		if strings.EqualFold(h.Key, "user-agent") {
-			return h.Value
-		}
-	}
-	for name, values := range req.Headers {
-		if strings.EqualFold(name, "user-agent") && len(values) > 0 {
-			return values[0]
-		}
-	}
-	return fingerprint.Get(s.inner.Config.Preset).UserAgent
 }
 
 // cloudflareBrowser sends a solve's steps on the session: exactly as given,

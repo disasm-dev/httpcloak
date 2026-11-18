@@ -88,6 +88,12 @@ type Session struct {
 	// Key: host (e.g., "example.com"), Value: set of requested hint names
 	clientHints map[string]map[string]bool
 
+	// clientHintValues replaces the preset's value for a high-entropy hint,
+	// keyed by lowercase header name. An anti-bot solve sets it with the
+	// values its payload was built with (SetClientHintValues), which the
+	// session then has to send for the rest of its life. Guarded by mu.
+	clientHintValues map[string]string
+
 	// clientHintsEnabled gates ALL UA client hints (the always-on sec-ch-ua trio
 	// AND high-entropy). Initialised from !Config.WithoutClientHints; toggle at
 	// runtime with SetClientHintsEnabled. When false the request is marked so the
@@ -1073,6 +1079,8 @@ func (s *Session) applyClientHints(host string, headers map[string][]string) {
 	ch := s.resolveClientHints()
 
 	// Map of Accept-CH hint names to their header name and resolved value.
+	// sec-ch-device-memory has no preset value: it goes out only once a solve
+	// has handed one over (SetClientHintValues).
 	hintValues := map[string]struct {
 		header string
 		value  string
@@ -1083,9 +1091,17 @@ func (s *Session) applyClientHints(host string, headers map[string][]string) {
 		"sec-ch-ua-model":             {"Sec-Ch-Ua-Model", ch.UAModel},
 		"sec-ch-ua-platform-version":  {"Sec-Ch-Ua-Platform-Version", ch.UAPlatformVersion},
 		"sec-ch-ua-wow64":             {"Sec-Ch-Ua-Wow64", ch.UAWow64},
+		"sec-ch-device-memory":        {"Sec-Ch-Device-Memory", ""},
 	}
 
+	s.mu.RLock()
+	overrides := s.clientHintValues
+	s.mu.RUnlock()
+
 	for hintName, hintInfo := range hintValues {
+		if v, ok := overrides[hintName]; ok {
+			hintInfo.value = v
+		}
 		if !hints[hintName] || hintInfo.value == "" {
 			continue
 		}
@@ -1124,6 +1140,76 @@ func headerKeyPresent(headers map[string][]string, key string) bool {
 		}
 	}
 	return false
+}
+
+// SetClientHintValues makes the session send these values for the
+// high-entropy client hints (keyed by header name, any case) in place of the
+// preset's, from now on, wherever a host asks for them via Accept-CH. Values
+// already set for other hints are kept. The low-entropy sec-ch-ua trio is the
+// preset's and is not taken from here.
+//
+// It exists for anti-bot payloads, which are built with a set of hint values
+// that every later request has to repeat exactly.
+func (s *Session) SetClientHintValues(values map[string]string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	merged := make(map[string]string, len(s.clientHintValues)+len(values))
+	for name, value := range s.clientHintValues {
+		merged[name] = value
+	}
+	for name, value := range values {
+		switch name = toLowerASCII(name); name {
+		case "sec-ch-ua", "sec-ch-ua-mobile", "sec-ch-ua-platform":
+			continue
+		}
+		merged[name] = value
+	}
+	s.clientHintValues = merged
+}
+
+// ClientHintValues returns the hint values SetClientHintValues installed.
+func (s *Session) ClientHintValues() map[string]string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make(map[string]string, len(s.clientHintValues))
+	for name, value := range s.clientHintValues {
+		out[name] = value
+	}
+	return out
+}
+
+// CookieFor returns the cookie called name that the jar would send to
+// requestURL.
+func (s *Session) CookieFor(requestURL, name string) (CookieState, bool) {
+	for _, c := range s.cookies.Get(extractHost(requestURL), extractPath(requestURL), isSecureURL(requestURL)) {
+		if c.Name == name {
+			return CookieState{Name: c.Name, Value: c.Value, Domain: c.Domain, Path: c.Path}, true
+		}
+	}
+	return CookieState{}, false
+}
+
+// DeleteCookieFor removes every cookie called name that the jar would send to
+// requestURL, under whichever domain it is kept.
+func (s *Session) DeleteCookieFor(requestURL, name string) {
+	for _, c := range s.cookies.Get(extractHost(requestURL), extractPath(requestURL), isSecureURL(requestURL)) {
+		if c.Name == name {
+			s.cookies.Delete(name, c.Domain)
+		}
+	}
+}
+
+// StoreSetCookie stores a Set-Cookie line as though requestURL's server had
+// sent it, attributes and domain scoping included. Any cookie of the same name
+// the jar would have sent to requestURL is removed first, so the line replaces
+// it even when the two are kept under different domains (host-only beside a
+// Domain cookie), rather than both going out.
+func (s *Session) StoreSetCookie(requestURL, line string) {
+	name, _, _ := strings.Cut(line, "=")
+	if name = strings.TrimSpace(name); name != "" {
+		s.DeleteCookieFor(requestURL, name)
+	}
+	s.extractCookies(map[string][]string{"Set-Cookie": {line}}, requestURL)
 }
 
 // SetClientHintsEnabled toggles all UA client hints (trio + high-entropy) at

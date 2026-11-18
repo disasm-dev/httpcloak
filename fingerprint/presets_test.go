@@ -96,12 +96,13 @@ func int64Ptr(v int64) *int64    { return &v }
 func TestH2HeaderOrderDefault(t *testing.T) {
 	p := Chrome146()
 	order := p.H2HeaderOrder()
-	// 27 = base Chrome order + the high-entropy UA client hints (sec-ch-ua-arch,
-	// -bitness, -full-version-list, -model, -platform-version, -wow64) and the
-	// conditional-cache validators (if-none-match, if-modified-since) the session
-	// injects. They live in the HPACK table so the wire order stays deterministic.
-	if len(order) != 27 {
-		t.Fatalf("expected 27 headers in Chrome default order, got %d", len(order))
+	// 28 = base Chrome order + the high-entropy UA client hints (sec-ch-ua-arch,
+	// -bitness, -full-version-list, -model, -platform-version, -wow64,
+	// sec-ch-device-memory) and the conditional-cache validators
+	// (if-none-match, if-modified-since) the session injects. They live in the
+	// HPACK table so the wire order stays deterministic.
+	if len(order) != 28 {
+		t.Fatalf("expected 28 headers in Chrome default order, got %d", len(order))
 	}
 	if order[0] != "cache-control" {
 		t.Fatalf("expected first header 'cache-control', got %q", order[0])
@@ -603,7 +604,7 @@ func TestAndroidChromeH2Config(t *testing.T) {
 func TestChromeH2ConfigNoRegression(t *testing.T) {
 	p := Chrome146()
 	order := p.H2HeaderOrder()
-	if len(order) != 27 || order[0] != "cache-control" {
+	if len(order) != 28 || order[0] != "cache-control" {
 		t.Fatalf("Chrome HPACK order regression: got %d headers, first=%q", len(order), order[0])
 	}
 	// Lockstep lock: the nil-H2Config fallback (H2HeaderOrder) must stay
@@ -651,8 +652,8 @@ func TestAllPresetsHaveH2Config(t *testing.T) {
 func TestH2GettersWithNilConfig(t *testing.T) {
 	p := &Preset{Name: "bare"}
 	// All should return Chrome defaults without panicking
-	if len(p.H2HeaderOrder()) != 27 {
-		t.Fatal("expected 27 element Chrome header order")
+	if len(p.H2HeaderOrder()) != 28 {
+		t.Fatal("expected 28 element Chrome header order")
 	}
 	if p.H2HPACKIndexingPolicy() != "chrome" {
 		t.Fatal("expected 'chrome'")

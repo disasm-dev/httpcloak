@@ -776,6 +776,7 @@ func (p *Preset) H2HeaderOrder() []string {
 	// the session-injected client hints in the same deterministic wire order.
 	return []string{
 		"cache-control",
+		"sec-ch-device-memory",
 		"sec-ch-ua", "sec-ch-ua-arch", "sec-ch-ua-bitness", "sec-ch-ua-full-version-list",
 		"sec-ch-ua-mobile", "sec-ch-ua-model",
 		"sec-ch-ua-platform", "sec-ch-ua-platform-version", "sec-ch-ua-wow64",
@@ -1270,6 +1271,7 @@ func chromeH2Config() *H2FingerprintConfig {
 			// to Go map iteration = random wire order per request = a stable tell.
 			// Real Chrome groups the high-entropy hints with the trio in this
 			// sequence, so we mirror it here.
+			"sec-ch-device-memory",
 			"sec-ch-ua", "sec-ch-ua-arch", "sec-ch-ua-bitness", "sec-ch-ua-full-version-list",
 			"sec-ch-ua-mobile", "sec-ch-ua-model",
 			"sec-ch-ua-platform", "sec-ch-ua-platform-version", "sec-ch-ua-wow64",
@@ -1309,6 +1311,7 @@ func chromeH2Config() *H2FingerprintConfig {
 			"pragma", "cache-control", "origin",
 			"sec-ch-ua-platform", "sec-ch-ua-platform-version",
 			"user-agent",
+			"sec-ch-device-memory",
 			"sec-ch-ua", "sec-ch-ua-arch", "sec-ch-ua-bitness", "sec-ch-ua-full-version-list",
 			"sec-ch-ua-mobile", "sec-ch-ua-model", "sec-ch-ua-wow64",
 			"content-type", "content-length",

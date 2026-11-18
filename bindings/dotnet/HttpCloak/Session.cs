@@ -235,6 +235,9 @@ public sealed class Session : IDisposable
     /// <param name="cloudflareApiKey">cf.antibotapi.com API key. When set, a response that is a Cloudflare challenge is solved through the service and the request sent again, inside the one call; cf_clearance stays in the session's cookies. The preset must send a User-Agent the service has a device for (chrome-latest-windows does) (default: null, off)</param>
     /// <param name="cloudflareJwtSecret">The Cloudflare key's JWT secret, for a key with JWT on (default: null)</param>
     /// <param name="cloudflareServiceUrl">Solve service address (default: null, https://cf.antibotapi.com)</param>
+    /// <param name="datadomeApiKey">dd.antibotapi.com API key. When set, a response that is a DataDome block (interstitial or slider captcha) is solved through the payload API and the request sent again, inside the one call; the datadome cookie stays in the session's cookies. A hard block (t=bv) fails once dropping the burned cookie does not clear it: change proxy. The preset must be Chrome on Windows (chrome-latest-windows) (default: null, off)</param>
+    /// <param name="datadomeJwtSecret">The DataDome key's signing secret, for a key with signing on (default: null)</param>
+    /// <param name="datadomeServiceUrl">Payload API address (default: null, https://dd.antibotapi.com)</param>
     public Session(
         string preset = "chrome-latest",
         string? proxy = null,
@@ -275,7 +278,10 @@ public sealed class Session : IDisposable
         bool? tcpDf = null,
         string? cloudflareApiKey = null,
         string? cloudflareJwtSecret = null,
-        string? cloudflareServiceUrl = null)
+        string? cloudflareServiceUrl = null,
+        string? datadomeApiKey = null,
+        string? datadomeJwtSecret = null,
+        string? datadomeServiceUrl = null)
     {
         Auth = auth;
 
@@ -319,7 +325,10 @@ public sealed class Session : IDisposable
             TcpDf = tcpDf,
             CloudflareApiKey = cloudflareApiKey,
             CloudflareJwtSecret = cloudflareJwtSecret,
-            CloudflareServiceUrl = cloudflareServiceUrl
+            CloudflareServiceUrl = cloudflareServiceUrl,
+            DatadomeApiKey = datadomeApiKey,
+            DatadomeJwtSecret = datadomeJwtSecret,
+            DatadomeServiceUrl = datadomeServiceUrl
         };
 
         string configJson = JsonSerializer.Serialize(config, JsonContext.Relaxed.SessionConfig);
@@ -2484,6 +2493,12 @@ public sealed class Session : IDisposable
     // the old shape too. PublicApiTests guards that.
     // ------------------------------------------------------------------
 
+    // The constructor as it stood before the datadome* parameters.
+    public Session(string preset, string? proxy, string? tcpProxy, string? udpProxy, int timeout, string httpVersion, bool verify, bool allowRedirects, int maxRedirects, int retry, int[]? retryOnStatus, int retryWaitMin, int retryWaitMax, bool preferIpv4, (string Username, string Password)? auth, Dictionary<string, string>? connectTo, string? echConfigDomain, bool tlsOnly, int quicIdleTimeout, string? localAddress, string? keyLogFile, bool enableSpeculativeTls, string? switchProtocol, bool withoutCookieJar, bool withoutConditionalCache, bool withoutClientHints, bool withoutHighEntropyClientHints, bool disableEch, bool disableHttp3, string? ja3, string? akamai, Dictionary<string, object>? extraFp, int? tcpTtl, int? tcpMss, int? tcpWindowSize, int? tcpWindowScale, bool? tcpDf, string? cloudflareApiKey, string? cloudflareJwtSecret, string? cloudflareServiceUrl)
+        : this(preset, proxy, tcpProxy, udpProxy, timeout, httpVersion, verify, allowRedirects, maxRedirects, retry, retryOnStatus, retryWaitMin, retryWaitMax, preferIpv4, auth, connectTo, echConfigDomain, tlsOnly, quicIdleTimeout, localAddress, keyLogFile, enableSpeculativeTls, switchProtocol, withoutCookieJar, withoutConditionalCache, withoutClientHints, withoutHighEntropyClientHints, disableEch, disableHttp3, ja3, akamai, extraFp, tcpTtl, tcpMss, tcpWindowSize, tcpWindowScale, tcpDf, cloudflareApiKey: cloudflareApiKey, cloudflareJwtSecret: cloudflareJwtSecret, cloudflareServiceUrl: cloudflareServiceUrl, datadomeApiKey: null, datadomeJwtSecret: null, datadomeServiceUrl: null)
+    {
+    }
+
     // The constructor as it stood before the cloudflare* parameters.
     public Session(string preset, string? proxy, string? tcpProxy, string? udpProxy, int timeout, string httpVersion, bool verify, bool allowRedirects, int maxRedirects, int retry, int[]? retryOnStatus, int retryWaitMin, int retryWaitMax, bool preferIpv4, (string Username, string Password)? auth, Dictionary<string, string>? connectTo, string? echConfigDomain, bool tlsOnly, int quicIdleTimeout, string? localAddress, string? keyLogFile, bool enableSpeculativeTls, string? switchProtocol, bool withoutCookieJar, bool withoutConditionalCache, bool withoutClientHints, bool withoutHighEntropyClientHints, bool disableEch, bool disableHttp3, string? ja3, string? akamai, Dictionary<string, object>? extraFp, int? tcpTtl, int? tcpMss, int? tcpWindowSize, int? tcpWindowScale, bool? tcpDf)
         : this(preset, proxy, tcpProxy, udpProxy, timeout, httpVersion, verify, allowRedirects, maxRedirects, retry, retryOnStatus, retryWaitMin, retryWaitMax, preferIpv4, auth, connectTo, echConfigDomain, tlsOnly, quicIdleTimeout, localAddress, keyLogFile, enableSpeculativeTls, switchProtocol, withoutCookieJar, withoutConditionalCache, withoutClientHints, withoutHighEntropyClientHints, disableEch, disableHttp3, ja3, akamai, extraFp, tcpTtl, tcpMss, tcpWindowSize, tcpWindowScale, tcpDf, cloudflareApiKey: null, cloudflareJwtSecret: null, cloudflareServiceUrl: null)
@@ -3938,6 +3953,18 @@ internal class SessionConfig
     [JsonPropertyName("cloudflare_service_url")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public string? CloudflareServiceUrl { get; set; }
+
+    [JsonPropertyName("datadome_api_key")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? DatadomeApiKey { get; set; }
+
+    [JsonPropertyName("datadome_jwt_secret")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? DatadomeJwtSecret { get; set; }
+
+    [JsonPropertyName("datadome_service_url")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? DatadomeServiceUrl { get; set; }
 }
 
 internal class RequestConfig

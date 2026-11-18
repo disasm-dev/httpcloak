@@ -26,6 +26,7 @@
 disasm-dev/httpcloak is [sardanioss/httpcloak](https://github.com/sardanioss/httpcloak) plus:
 
 - **Cloudflare challenges cleared for you.** `WithCloudflare(apiKey)` hands a challenge page to the [cf.antibotapi.com](https://cf.antibotapi.com) solve service, sends the requests it answers with through the session itself (its own TLS fingerprint, connection and cookie jar), then sends your request again, all inside the one call.
+- **DataDome blocks solved for you.** `WithDatadome(apiKey)` answers the interstitial ("Verifying your device") and the slider captcha through the [dd.antibotapi.com](https://docs.disasm.dev/datadome/overview/) payload API: the challenge page is loaded and the payload submitted through the session itself, the `datadome` cookie lands in its jar, the client hints the payload was built with are sent from then on, and your request goes out again, all inside the one call. A hard block (`t=bv`) comes back as `datadome.ErrHardBlocked`: change proxy.
 - **Chrome-parity fixes** in httpcloak and in its net, quic-go and utls dependencies, which come from [disasm-dev/net](https://github.com/disasm-dev/net), [disasm-dev/quic-go](https://github.com/disasm-dev/quic-go) and [disasm-dev/utls](https://github.com/disasm-dev/utls).
 
 ### Use it from Go
@@ -45,6 +46,12 @@ go mod tidy
 s := httpcloak.NewSession("chrome-latest-windows", httpcloak.WithCloudflare("<cf.antibotapi.com key>"))
 defer s.Close()
 resp, err := s.Get(context.Background(), "https://a-site-behind-cloudflare.example")
+```
+
+```go
+s := httpcloak.NewSession("chrome-latest-windows", httpcloak.WithDatadome("<dd.antibotapi.com key>"))
+defer s.Close()
+resp, err := s.Get(context.Background(), "https://a-site-behind-datadome.example")
 ```
 
 `v1.7.300` is upstream v1.7.3 plus these changes; `v1.7.301` on are further releases on that base, and `v1.7.400` follows upstream v1.7.4. The Python, Node and .NET packages of the fork are not published yet.

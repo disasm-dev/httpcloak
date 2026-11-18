@@ -30,6 +30,7 @@ import (
 
 	"github.com/sardanioss/httpcloak"
 	"github.com/sardanioss/httpcloak/cloudflare"
+	"github.com/sardanioss/httpcloak/datadome"
 	"github.com/sardanioss/httpcloak/dns"
 	"github.com/sardanioss/httpcloak/fingerprint"
 	"github.com/sardanioss/httpcloak/protocol"
@@ -331,6 +332,9 @@ type SessionConfig struct {
 	CloudflareAPIKey              string                 `json:"cloudflare_api_key,omitempty"`                // cf.antibotapi.com key: clear Cloudflare challenges (WithCloudflare)
 	CloudflareJWTSecret           string                 `json:"cloudflare_jwt_secret,omitempty"`             // The key's JWT secret, for a key with JWT on
 	CloudflareServiceURL          string                 `json:"cloudflare_service_url,omitempty"`            // Solve service address (default https://cf.antibotapi.com)
+	DatadomeAPIKey                string                 `json:"datadome_api_key,omitempty"`                  // dd.antibotapi.com key: answer DataDome blocks (WithDatadome)
+	DatadomeJWTSecret             string                 `json:"datadome_jwt_secret,omitempty"`               // The key's signing secret, for a key with signing on
+	DatadomeServiceURL            string                 `json:"datadome_service_url,omitempty"`              // Payload API address (default https://dd.antibotapi.com)
 }
 
 // Error response
@@ -1351,6 +1355,14 @@ func httpcloak_session_new(configJSON *C.char) (hcRet C.int64_t) {
 			APIKey:     config.CloudflareAPIKey,
 			JWTSecret:  config.CloudflareJWTSecret,
 			ServiceURL: config.CloudflareServiceURL,
+		}))
+	}
+
+	if config.DatadomeAPIKey != "" {
+		opts = append(opts, httpcloak.WithDatadomeConfig(datadome.Config{
+			APIKey:     config.DatadomeAPIKey,
+			JWTSecret:  config.DatadomeJWTSecret,
+			ServiceURL: config.DatadomeServiceURL,
 		}))
 	}
 

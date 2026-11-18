@@ -83,6 +83,16 @@ public data class SessionConfig @JvmOverloads constructor(
     public val cloudflareJwtSecret: String? = null,
     /** Solve service address (library default https://cf.antibotapi.com). */
     public val cloudflareServiceUrl: String? = null,
+    /**
+     * dd.antibotapi.com API key. When set, a response that is a DataDome block (interstitial or
+     * slider captcha) is solved through the payload API and the request sent again, inside the one
+     * call; the datadome cookie stays in the session's cookies. The preset must be Chrome on Windows.
+     */
+    public val datadomeApiKey: String? = null,
+    /** The DataDome key's signing secret, for a key with signing on. */
+    public val datadomeJwtSecret: String? = null,
+    /** Payload API address (library default https://dd.antibotapi.com). */
+    public val datadomeServiceUrl: String? = null,
 ) {
     internal fun toJson(): String {
         val json = JSONObject()
@@ -132,6 +142,9 @@ public data class SessionConfig @JvmOverloads constructor(
         put("cloudflare_api_key", cloudflareApiKey)
         put("cloudflare_jwt_secret", cloudflareJwtSecret)
         put("cloudflare_service_url", cloudflareServiceUrl)
+        put("datadome_api_key", datadomeApiKey)
+        put("datadome_jwt_secret", datadomeJwtSecret)
+        put("datadome_service_url", datadomeServiceUrl)
         return json.toString()
     }
 }

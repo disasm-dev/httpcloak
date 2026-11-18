@@ -162,6 +162,10 @@ func (s *Session) forkOne() *Session {
 		cookies:      s.cookies, // shared pointer — thread-safe CookieJar
 		cacheEntries: cacheEntries,
 		clientHints:  clientHints,
+		// Never written in place (SetClientHintValues swaps the map), so the
+		// fork can hold the parent's. It shares the jar, and a cookie earned
+		// with these hints has to keep travelling with them.
+		clientHintValues: s.clientHintValues,
 		// Inherit the parent's runtime client-hint gates (read under the RLock
 		// Fork holds), so forks behave like the parent rather than defaulting off.
 		clientHintsEnabled:            s.clientHintsEnabled,
