@@ -19,8 +19,8 @@ import (
 // on the client.Client path: a stream that is still being read must survive the
 // pool reaper deciding the connection is too old for new requests.
 //
-// The connection is force-aged past maxConnAge and CloseIdle() is called
-// directly, so the 90s/5m timers never have to elapse.
+// The connection is force-aged past the pool's age limit and CloseIdle() is
+// called directly, so neither the 90s idle timer nor the limit has to elapse.
 //
 // Test shape (real H2 httptest server driven with WithForceHTTP2) borrowed from
 // PR #84.

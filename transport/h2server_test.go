@@ -141,13 +141,25 @@ type h2Config struct {
 	// Body is the response body. Nil means "ok".
 	Body []byte
 
+	// ResponseHeaders are extra fields sent after :status, in this order,
+	// name repeated per value. Names must be lowercase, as HTTP/2 requires.
+	ResponseHeaders [][2]string
+
+	// Informational, when non-empty, is sent as a 103 response ahead of the
+	// final one, with these fields in this order. Names must be lowercase.
+	Informational [][2]string
+
+	// Trailers, when non-empty, end the stream with a HEADERS frame carrying
+	// these fields instead of an empty DATA frame. Names must be lowercase.
+	Trailers [][2]string
+
 	// SendContentLength puts a content-length on the response. Without it the
 	// client sees an unknown length, which adds a trailing empty DATA frame.
 	SendContentLength bool
 
-	// ResponseHeaders, when set, is called for every response and its headers
+	// DynamicResponseHeaders, when set, is called for every response and its headers
 	// added, lowercase names. A func so a test can change them mid-run.
-	ResponseHeaders func() map[string]string
+	DynamicResponseHeaders func() map[string]string
 
 	// Chunk splits the response body into frames of at most this many bytes,
 	// each separated by ChunkDelay. Zero sends the body as one frame.
@@ -297,7 +309,7 @@ func (s *h2Server) dump() string {
 	return b.String()
 }
 
-func startH2Server(t *testing.T, cfg h2Config) *h2Server {
+func startH2Server(t testing.TB, cfg h2Config) *h2Server {
 	t.Helper()
 
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
@@ -692,9 +704,22 @@ func (hc *h2Conn) respond(streamID uint32) {
 		body = []byte("ok")
 	}
 
+	if len(cfg.Informational) > 0 {
+		var ib strings.Builder
+		ienc := hpack.NewEncoder(&ib)
+		ienc.WriteField(hpack.HeaderField{Name: ":status", Value: "103"})
+		for _, hv := range cfg.Informational {
+			ienc.WriteField(hpack.HeaderField{Name: hv[0], Value: hv[1]})
+		}
+		hc.writeFrame(frHeaders, flEndHeaders, streamID, []byte(ib.String()))
+	}
+
 	var buf strings.Builder
 	enc := hpack.NewEncoder(&buf)
 	enc.WriteField(hpack.HeaderField{Name: ":status", Value: "200"})
+	for _, hv := range cfg.ResponseHeaders {
+		enc.WriteField(hpack.HeaderField{Name: hv[0], Value: hv[1]})
+	}
 	if cfg.SendContentLength {
 		enc.WriteField(hpack.HeaderField{
 			Name:  "content-length",
@@ -702,8 +727,8 @@ func (hc *h2Conn) respond(streamID uint32) {
 		})
 	}
 	var extra map[string]string
-	if cfg.ResponseHeaders != nil {
-		extra = cfg.ResponseHeaders()
+	if cfg.DynamicResponseHeaders != nil {
+		extra = cfg.DynamicResponseHeaders()
 	}
 	for name, value := range extra {
 		enc.WriteField(hpack.HeaderField{Name: name, Value: value})
@@ -748,7 +773,16 @@ func (hc *h2Conn) respond(streamID uint32) {
 	if cfg.HoldEndStream != nil {
 		<-cfg.HoldEndStream
 	}
-	hc.writeFrame(frData, flEndStream, streamID, nil)
+	if len(cfg.Trailers) > 0 {
+		var tb strings.Builder
+		tenc := hpack.NewEncoder(&tb)
+		for _, hv := range cfg.Trailers {
+			tenc.WriteField(hpack.HeaderField{Name: hv[0], Value: hv[1]})
+		}
+		hc.writeFrame(frHeaders, flEndHeaders|flEndStream, streamID, []byte(tb.String()))
+	} else {
+		hc.writeFrame(frData, flEndStream, streamID, nil)
+	}
 
 	hc.doneMu.Lock()
 	hc.responded++

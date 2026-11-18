@@ -9,9 +9,9 @@ require (
 	github.com/klauspost/compress v1.18.2 // indirect
 	github.com/miekg/dns v1.1.69 // indirect
 	github.com/sardanioss/http v1.2.0 // indirect
-	github.com/sardanioss/net v1.2.12 // indirect
+	github.com/sardanioss/net v1.2.14 // indirect
 	github.com/sardanioss/qpack v0.6.3 // indirect
-	github.com/sardanioss/quic-go v1.2.30 // indirect
+	github.com/sardanioss/quic-go v1.2.31 // indirect
 	github.com/sardanioss/udpbara v1.1.0 // indirect
 	github.com/sardanioss/utls v1.10.5 // indirect
 	golang.org/x/crypto v0.46.0 // indirect
@@ -28,7 +28,7 @@ replace github.com/sardanioss/httpcloak => ../..
 
 // disasm-dev's forks carrying the Chrome-parity fixes, as in the root go.mod.
 replace (
-	github.com/sardanioss/net => github.com/disasm-dev/net v1.2.1200
-	github.com/sardanioss/quic-go => github.com/disasm-dev/quic-go v1.2.3000
+	github.com/sardanioss/net => ../../../httpcloak-forks/net
+	github.com/sardanioss/quic-go => ../../../httpcloak-forks/quic-go
 	github.com/sardanioss/utls => github.com/disasm-dev/utls v1.10.500
 )

@@ -127,15 +127,15 @@ Console.WriteLine(resp.StatusCode);
 
 ### Presets
 
-- **Chrome**: 133, 141, 143 through 155, with per-OS variants
+- **Chrome**: 133, 141, 143 through 158, with per-OS variants
   (Windows / Linux / macOS / Android / iOS) where they differ. iOS
-  goes up to 152.
+  goes up to 155.
 - **Firefox**: 133, 148.
-- **Safari**: 18 (desktop), 17 / 18 (iOS).
+- **Safari**: 18 (desktop), 17 / 18 / 26 (iOS). Safari 26 iOS currently covers HTTP/2; no QUIC capture is included.
 - **`chrome-latest` aliases**: `chrome-latest`, `chrome-latest-windows`,
   `chrome-latest-linux`, `chrome-latest-macos`, `chrome-latest-android`,
   `chrome-latest-ios`. Auto-track the newest shipped Chrome major
-  (155).
+  (158; iOS 155).
 
 ### Bindings
 
@@ -144,6 +144,8 @@ Console.WriteLine(resp.StatusCode);
 - **Node.js**: `npm install httpcloak`
 - **.NET**: `dotnet add package HttpCloak`
 - **Android (Kotlin)**: build from source, see [Android](/bindings/android)
+
+The Python, Node.js and .NET packages ship a prebuilt native library for Windows 10 and later (x64), macOS 12 and later (Intel and Apple Silicon), and Linux on x64 and arm64 with glibc 2.17 or later. Alpine and other musl systems aren't supported yet. The Go module builds from source wherever Go and cgo do.
 
 ## Where to next
 

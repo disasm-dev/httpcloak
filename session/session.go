@@ -11,8 +11,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/url"
 	"os"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -157,9 +160,9 @@ func NewSessionWithOptions(id string, config *protocol.SessionConfig, opts *Sess
 		}
 	}
 
-	// Create transport config with ConnectTo, ECH, TLS-only, QUIC timeout, localAddr, and session cache settings
+	// Create transport config with connection settings and session cache options.
 	var transportConfig *transport.TransportConfig
-	needsConfig := len(config.ConnectTo) > 0 || config.ECHConfigDomain != "" || config.TLSOnly || config.QuicIdleTimeout > 0 || config.LocalAddress != "" || keyLogWriter != nil || config.EnableSpeculativeTLS
+	needsConfig := len(config.ConnectTo) > 0 || config.ECHConfigDomain != "" || config.TLSOnly || config.QuicIdleTimeout > 0 || config.HTTP2MaxConnAge != 0 || config.LocalAddress != "" || keyLogWriter != nil || config.EnableSpeculativeTLS
 	if opts != nil && (opts.SessionCacheBackend != nil || opts.CustomJA3 != "" || opts.CustomH2Settings != nil || len(opts.CustomPseudoOrder) > 0 || opts.CustomTCPFingerprint != nil) {
 		needsConfig = true
 	}
@@ -170,6 +173,7 @@ func NewSessionWithOptions(id string, config *protocol.SessionConfig, opts *Sess
 			ECHConfigDomain:      config.ECHConfigDomain,
 			TLSOnly:              config.TLSOnly,
 			QuicIdleTimeout:      time.Duration(config.QuicIdleTimeout) * time.Second,
+			HTTP2MaxConnAge:      time.Duration(config.HTTP2MaxConnAge) * time.Second,
 			LocalAddr:            config.LocalAddress,
 			KeyLogWriter:         keyLogWriter,
 			EnableSpeculativeTLS: config.EnableSpeculativeTLS,
@@ -293,6 +297,44 @@ func cloneHeaders(h map[string][]string) map[string][]string {
 	return out
 }
 
+// hasHeaderAnyCase reports whether h holds name in any spelling.
+func hasHeaderAnyCase(h map[string][]string, name string) bool {
+	for k := range h {
+		if strings.EqualFold(k, name) {
+			return true
+		}
+	}
+	return false
+}
+
+// takeCookieHeader removes every spelling of Cookie from h and returns the
+// caller's cookies as one string, joined in key order so the result does not
+// depend on map order. The transport keeps one spelling of a header name and
+// prefers the canonical one, so a caller's "cookie" left next to the jar's
+// "Cookie" would be dropped; folding it in first keeps both.
+func takeCookieHeader(h map[string][]string) string {
+	var keys []string
+	for k := range h {
+		if strings.EqualFold(k, "Cookie") {
+			keys = append(keys, k)
+		}
+	}
+	if len(keys) == 0 {
+		return ""
+	}
+	sort.Strings(keys)
+	var parts []string
+	for _, k := range keys {
+		for _, v := range h[k] {
+			if v != "" {
+				parts = append(parts, v)
+			}
+		}
+		delete(h, k)
+	}
+	return strings.Join(parts, "; ")
+}
+
 // requestWithRedirects handles the actual request with redirect following
 func (s *Session) requestWithRedirects(ctx context.Context, req *transport.Request, redirectCount int, history []*transport.RedirectInfo) (*transport.Response, error) {
 	// Work on a private copy of the caller's request. The session mutates
@@ -361,10 +403,11 @@ func (s *Session) requestWithRedirects(ctx context.Context, req *transport.Reque
 	// hasn't opted out. Skipping here also means a fresh fetch on this URL.
 	if s.conditionalCacheEnabled && !req.DisableConditionalCache {
 		if cached, exists := s.cacheEntries[req.URL]; exists {
-			if cached.etag != "" {
+			// A validator the caller set, in any spelling, wins.
+			if cached.etag != "" && !hasHeaderAnyCase(req.Headers, "If-None-Match") {
 				req.Headers["If-None-Match"] = []string{cached.etag}
 			}
-			if cached.lastModified != "" {
+			if cached.lastModified != "" && !hasHeaderAnyCase(req.Headers, "If-Modified-Since") {
 				req.Headers["If-Modified-Since"] = []string{cached.lastModified}
 			}
 		}
@@ -404,10 +447,11 @@ func (s *Session) requestWithRedirects(ctx context.Context, req *transport.Reque
 	requestPath := extractPath(req.URL)
 	requestSecure := isSecureURL(req.URL)
 
-	// Save original per-request Cookie header before retry loop to prevent accumulation
-	var origCookie string
-	if c := req.Headers["Cookie"]; len(c) > 0 {
-		origCookie = c[0]
+	// Save original per-request Cookie header before retry loop to prevent
+	// accumulation. Every spelling the caller used is folded into one.
+	origCookie := takeCookieHeader(req.Headers)
+	if origCookie != "" {
+		req.Headers["Cookie"] = []string{origCookie}
 	}
 
 	// The caller's list, kept unfilled: each attempt fills the Cookie slot from it and a
@@ -665,15 +709,15 @@ func (s *Session) requestWithRedirects(ctx context.Context, req *transport.Reque
 
 			// Copy safe headers
 			for k, v := range req.Headers {
+				lk := strings.ToLower(k)
 				// Don't copy Content-* headers on method change
-				if newMethod != req.Method && (k == "Content-Type" || k == "Content-Length" || k == "content-type" || k == "content-length") {
+				if newMethod != req.Method && (lk == "content-type" || lk == "content-length") {
 					continue
 				}
 				// Don't copy Cookie header (will be re-added from session)
-				if k == "Cookie" || k == "cookie" {
+				if lk == "cookie" {
 					continue
 				}
-				lk := strings.ToLower(k)
 				if schemeDowngrade && lk == "referer" {
 					continue
 				}
@@ -683,22 +727,50 @@ func (s *Session) requestWithRedirects(ctx context.Context, req *transport.Reque
 				newReq.Headers[k] = v
 			}
 
-			// Synthesize the next-hop Referer to match Chrome's default
-			// strict-origin-when-cross-origin policy. A browser sends a Referer
-			// on every redirect hop except an https->http downgrade; httpcloak
-			// previously carried a stale copied value (or none at all), which a
-			// server inspecting the redirect chain can use to fingerprint it.
-			// Drop any copied Referer (either casing) first so we don't emit a
-			// duplicate, then set the policy-correct value.
+			// Referer and Sec-Fetch-Site follow the chain as Chrome 158 sent
+			// them, recorded on a typed navigation and on one a page started,
+			// each redirected same-origin and then to another site. Every hop
+			// sends the FIRST request's referrer, not the URL that redirected,
+			// under strict-origin-when-cross-origin for the hop's own URL, as
+			// Fetch keeps a request's referrer across redirects. So a typed
+			// navigation sends no Referer on any hop. Until this, each hop sent
+			// the URL that redirected (#70 asked for that, but Chrome doesn't).
 			//
-			// DisableRedirectReferer suppresses the synthesis but NOT the two
-			// deletes: a Referer the caller put on the original request names the
-			// pre-redirect URL, and carrying it to the new host would leak exactly
-			// what the caller asked us not to send.
-			delete(newReq.Headers, "Referer")
-			delete(newReq.Headers, "referer")
+			// A Sec-Fetch-Site the caller set starts the chain, and from there
+			// only grows less trusting: "none" stays "none", and a hop that
+			// leaves the referrer's site makes it cross-site for the rest of the
+			// chain. Without one the transport picks the value on each hop as
+			// on the first request.
+			//
+			// The copied Referer (either casing) is dropped first so none goes
+			// out twice. DisableRedirectReferer suppresses the hop's Referer but
+			// not that delete: the caller's own names the page the chain
+			// started from, which is what they asked not to send.
+			chain, inChain := ctx.Value(redirectChainKey{}).(redirectChain)
+			if !inChain {
+				chain.referer = headerValueFold(req.Headers, "Referer")
+				chain.site = strings.ToLower(headerValueFold(req.Headers, "Sec-Fetch-Site"))
+			}
+			for k := range newReq.Headers {
+				if strings.EqualFold(k, "Referer") {
+					delete(newReq.Headers, k)
+				}
+			}
+			if chain.site != "" {
+				if chain.site != "none" && chain.referer != "" {
+					if rel := fetchSiteRelation(chain.referer, redirectURL); fetchSiteRank(rel) > fetchSiteRank(chain.site) {
+						chain.site = rel
+					}
+				}
+				for k := range newReq.Headers {
+					if strings.EqualFold(k, "Sec-Fetch-Site") {
+						newReq.Headers[k] = []string{chain.site}
+					}
+				}
+			}
+			ctx = context.WithValue(ctx, redirectChainKey{}, chain)
 			if !req.DisableRedirectReferer {
-				if ref := redirectReferer(req.URL, schemeDowngrade, crossOrigin); ref != "" {
+				if ref := chainReferer(chain.referer, redirectURL); ref != "" {
 					newReq.Headers["Referer"] = []string{ref}
 				}
 			}
@@ -870,7 +942,8 @@ func (s *Session) extractCookies(headers map[string][]string, requestURL string)
 					cookie.Expires = &t
 				}
 			case "max-age":
-				cookie.MaxAge = parseIntSimple(attrValue)
+				// The last Max-Age decides; an invalid one leaves none.
+				cookie.MaxAge, _ = parseMaxAge(attrValue)
 			case "samesite":
 				// Normalize to capitalized form
 				sameSiteLower := toLowerASCII(attrValue)
@@ -910,27 +983,43 @@ func splitBySemicolon(s string) []string {
 	return result
 }
 
-// parseIntSimple parses an integer from a string, returns 0 on error
-func parseIntSimple(s string) int {
-	result := 0
-	negative := false
-	start := 0
-	if len(s) > 0 && s[0] == '-' {
-		negative = true
-		start = 1
+// parseMaxAge reads a Max-Age attribute as Chromium does
+// (CanonicalCookie::CreateExpiration): zero or less means delete now and
+// comes back as -1, a value too large for an int is clamped rather than
+// dropped, and anything that isn't an optional '-' and digits is invalid.
+// The caller stores the result whether or not it is valid: the last Max-Age
+// attribute decides, and an invalid one leaves the cookie with none.
+func parseMaxAge(s string) (int, bool) {
+	digits := strings.TrimPrefix(s, "-")
+	if digits == "" {
+		return 0, false
 	}
-	for i := start; i < len(s); i++ {
-		if s[i] >= '0' && s[i] <= '9' {
-			result = result*10 + int(s[i]-'0')
-		} else {
-			break
+	for i := 0; i < len(digits); i++ {
+		if digits[i] < '0' || digits[i] > '9' {
+			return 0, false
 		}
 	}
-	if negative {
-		result = -result
+	if len(digits) != len(s) {
+		return -1, true // a negative Max-Age, however long
 	}
-	return result
+	seconds, err := strconv.Atoi(s)
+	if err != nil || seconds > maxCookieAgeSeconds {
+		// Chromium caps a cookie's lifetime at 400 days however it was
+		// set, so a longer Max-Age (or one too large to parse) means 400
+		// days. Capping here also keeps the value inside 32 bits, which the
+		// bindings rely on: a JS number cannot hold MaxInt64 exactly, and
+		// Android reads max_age as an int.
+		return maxCookieAgeSeconds, true
+	}
+	if seconds <= 0 {
+		seconds = -1
+	}
+	return seconds, true
 }
+
+// maxCookieAgeSeconds is Chromium's 400-day cap on a cookie's lifetime
+// (CanonicalCookie::ValidateAndAdjustExpiryDate).
+const maxCookieAgeSeconds = 400 * 24 * 60 * 60
 
 // parseHTTPDate parses an HTTP date string (RFC1123 format)
 func parseHTTPDate(s string) (time.Time, error) {
@@ -1894,8 +1983,17 @@ func (s *Session) RequestStream(ctx context.Context, req *transport.Request) (*S
 		req.Headers = make(map[string][]string)
 	}
 
+	// Every spelling of the caller's Cookie is folded into one first, as the
+	// buffered path does. Folding only when the jar had something to add left
+	// a fresh session (or one WithoutCookieJar) sending two spellings, and the
+	// transport keeps only the canonical one, so the caller's lowercase
+	// cookie was dropped.
+	callerCookie := takeCookieHeader(req.Headers)
+	if callerCookie != "" {
+		req.Headers["Cookie"] = []string{callerCookie}
+	}
 	// Add session cookies to request headers using proper domain/path matching.
-	// Skip when WithoutCookieJar — caller-provided Cookie headers still pass through.
+	// Skip when WithoutCookieJar; caller-provided Cookie headers still pass through.
 	var sessionCookies string
 	if !s.Config.WithoutCookieJar {
 		requestHost := extractHost(req.URL)
@@ -1903,9 +2001,11 @@ func (s *Session) RequestStream(ctx context.Context, req *transport.Request) (*S
 		requestSecure := isSecureURL(req.URL)
 		sessionCookies = s.cookies.BuildCookieHeader(requestHost, requestPath, requestSecure)
 		if sessionCookies != "" {
-			existingCookies := req.Headers["Cookie"]
-			if len(existingCookies) > 0 && existingCookies[0] != "" {
-				req.Headers["Cookie"] = []string{existingCookies[0] + "; " + sessionCookies}
+			if req.Headers == nil {
+				req.Headers = map[string][]string{}
+			}
+			if callerCookie != "" {
+				req.Headers["Cookie"] = []string{callerCookie + "; " + sessionCookies}
 			} else {
 				req.Headers["Cookie"] = []string{sessionCookies}
 			}
@@ -2001,6 +2101,77 @@ func parseOrigin(urlStr string) (scheme, host, port string) {
 		}
 	}
 	return scheme, host, port
+}
+
+// redirectChainKey carries a redirect chain's referrer and Sec-Fetch-Site
+// from one hop to the next, on the context requestWithRedirects passes down.
+type redirectChainKey struct{}
+
+type redirectChain struct {
+	referer string // the Referer the chain's first request carried
+	site    string // the caller's Sec-Fetch-Site, as it stands for the hop before
+}
+
+// headerValueFold returns the first value of name in h, in any spelling.
+func headerValueFold(h map[string][]string, name string) string {
+	for k, v := range h {
+		if strings.EqualFold(k, name) && len(v) > 0 {
+			return v[0]
+		}
+	}
+	return ""
+}
+
+// fetchSiteRank orders Sec-Fetch-Site values from most to least trusting.
+func fetchSiteRank(v string) int {
+	switch v {
+	case "same-origin":
+		return 1
+	case "same-site":
+		return 2
+	case "cross-site":
+		return 3
+	}
+	return 0
+}
+
+// fetchSiteRelation is the Sec-Fetch-Site a request to target gets from a page
+// at referrer: same-origin, same-site (same scheme and registrable domain,
+// any port), or cross-site.
+func fetchSiteRelation(referrer, target string) string {
+	if sameOrigin(referrer, target) {
+		return "same-origin"
+	}
+	rs, rh, _ := parseOrigin(referrer)
+	ts, th, _ := parseOrigin(target)
+	if rs != "" && rs == ts && rh != "" && registrableDomain(rh) == registrableDomain(th) {
+		return "same-site"
+	}
+	return "cross-site"
+}
+
+// registrableDomain approximates eTLD+1 with the last two labels, as the
+// client package's Sec-Fetch-Site detection does. An IP literal is its own site.
+func registrableDomain(host string) string {
+	if net.ParseIP(strings.Trim(host, "[]")) != nil {
+		return host
+	}
+	parts := strings.Split(host, ".")
+	if len(parts) <= 2 {
+		return host
+	}
+	return strings.Join(parts[len(parts)-2:], ".")
+}
+
+// chainReferer returns the Referer a redirect hop to target sends for a chain
+// whose first request carried referrer: "" with none, or from https to http,
+// and otherwise redirectReferer's strict-origin-when-cross-origin form of it
+// for target.
+func chainReferer(referrer, target string) string {
+	if referrer == "" {
+		return ""
+	}
+	return redirectReferer(referrer, isSchemeDowngrade(referrer, target), !sameOrigin(referrer, target))
 }
 
 // redirectReferer returns the Referer value to send on the next redirect hop,

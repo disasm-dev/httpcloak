@@ -19,6 +19,7 @@ import (
 	"github.com/sardanioss/httpcloak/dns"
 	"github.com/sardanioss/httpcloak/fingerprint"
 	"github.com/sardanioss/httpcloak/internal/h2build"
+	"github.com/sardanioss/httpcloak/internal/respheader"
 	"github.com/sardanioss/httpcloak/proxy"
 	"github.com/sardanioss/net/http2"
 	tls "github.com/sardanioss/utls"
@@ -79,6 +80,12 @@ type HTTP2Transport struct {
 	insecureSkipVerify   bool
 	tlsVerify            *TLSVerify
 	localAddr            string // Local IP to bind outgoing connections
+
+	// canonicalHeadersForTest makes the transport behave as releases before
+	// WireCaseResponseHeaders did: connections are built with it off and no
+	// trace is layered for 1xx maps. Tests set it to get the reference that
+	// RoundTrip is compared against; nothing else does.
+	canonicalHeadersForTest bool
 
 	// Cleanup
 	stopCleanup     chan struct{}
@@ -293,7 +300,10 @@ func NewHTTP2TransportWithConfig(preset *fingerprint.Preset, dnsCache *dns.Cache
 		shuffleSeed:  shuffleSeed,
 		hasPSKSpec:   hasPSKSpec,
 		maxIdleTime:  90 * time.Second,
-		maxConnAge:   5 * time.Minute,
+		// A connection older than this takes no new requests; zero means no
+		// limit. Five minutes unless TransportConfig.HTTP2MaxConnAge says
+		// otherwise.
+		maxConnAge: defaultHTTP2MaxConnAge,
 		// A response body that has not produced a single byte for this long is
 		// treated as abandoned by its caller, so the connection can be
 		// reclaimed. Without a bound here, a caller that never closes a body
@@ -301,6 +311,11 @@ func NewHTTP2TransportWithConfig(preset *fingerprint.Preset, dnsCache *dns.Cache
 		abandonedBodyTimeout: 10 * time.Minute,
 		connectTimeout:       30 * time.Second,
 		stopCleanup:          make(chan struct{}),
+	}
+	if config != nil && config.HTTP2MaxConnAge > 0 {
+		t.maxConnAge = config.HTTP2MaxConnAge
+	} else if config != nil && config.HTTP2MaxConnAge < 0 {
+		t.maxConnAge = 0 // turned off
 	}
 
 	// Apply localAddr from config
@@ -348,15 +363,41 @@ func connClosing(c *persistentConn) bool {
 }
 
 // RoundTrip implements http.RoundTripper
+//
+// The response's Header is keyed in canonical form, exactly as it was before
+// the connection started asking the HTTP/2 layer for the wire's lowercase names
+// (WireCaseResponseHeaders), so Header.Get, Cookies and Location work as they
+// do on any net/http response. Trailers are canonical as always, and the 1xx
+// header maps a ClientTrace's Got1xxResponse receives are canonical too. Only
+// this exported entry point converts: the Transport's own requests keep the
+// wire case, because they lowercase every name for Response.Headers anyway.
 func (t *HTTP2Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 	resp, _, err := t.roundTrip(req)
-	return resp, err
+	if err != nil {
+		return nil, err
+	}
+	respheader.Canonical(resp.Header)
+	return resp, nil
 }
 
 // roundTrip is RoundTrip, also saying whether any of the request may have
 // reached the server. sent is false only when no connection could be had for
 // the first attempt, so nothing was written.
+//
+// The response's Header is keyed as the wire carried it. Callers inside this
+// package read it through internal/respheader or by exact key; RoundTrip
+// converts it for everyone else.
 func (t *HTTP2Transport) roundTrip(req *http.Request) (resp *http.Response, sent bool, err error) {
+	// A 1xx map reaches a caller's trace during the round trip, so it is made
+	// canonical here, on every path, rather than at RoundTrip's return. The
+	// request the response records is put back to the caller's below.
+	if !t.canonicalHeadersForTest {
+		if ctx, ok := respheader.WithCanonical1xx(req.Context()); ok {
+			orig, copied := req, req.WithContext(ctx)
+			req = copied
+			defer func() { respheader.RestoreRequest(resp, copied, orig) }()
+		}
+	}
 	t.connsMu.RLock()
 	if t.closed {
 		t.connsMu.RUnlock()
@@ -619,6 +660,11 @@ func (t *HTTP2Transport) getOrCreateConn(ctx context.Context, host, port, key st
 	return v.(*persistentConn), nil
 }
 
+// defaultHTTP2MaxConnAge is how old an HTTP/2 connection may get before new
+// requests go out on a fresh one, unless the caller sets a limit or turns it
+// off.
+const defaultHTTP2MaxConnAge = 5 * time.Minute
+
 // isConnUsable reports whether a connection may be handed out for a NEW request.
 //
 // This is deliberately separate from isConnDestroyable: "too old to start
@@ -630,30 +676,29 @@ func (t *HTTP2Transport) getOrCreateConn(ctx context.Context, host, port, key st
 // even when the connection is fine. We'll handle errors during actual use.
 func (t *HTTP2Transport) isConnUsable(conn *persistentConn) bool {
 	conn.mu.Lock()
-	defer conn.mu.Unlock()
-
-	// Already evicted and waiting for its last body to finish.
-	if conn.closeRequested {
+	// Not evicted and waiting for its last body, not too old, and not idle
+	// for too long. Idle time doesn't count while requests are in flight,
+	// or cleanup would kill long downloads (>maxIdleTime).
+	usable := !conn.closeRequested &&
+		(t.maxConnAge <= 0 || time.Since(conn.createdAt) <= t.maxConnAge) &&
+		(conn.inFlight > 0 || time.Since(conn.lastUsedAt) <= t.maxIdleTime)
+	h2Conn := conn.h2Conn
+	conn.mu.Unlock()
+	if !usable || h2Conn == nil {
 		return false
 	}
 
-	// Check age
-	if time.Since(conn.createdAt) > t.maxConnAge {
-		return false
-	}
-
-	// Check idle time — but not if requests are actively in-flight.
-	// Without this, long downloads (>maxIdleTime) get killed by cleanup.
-	if conn.inFlight == 0 && time.Since(conn.lastUsedAt) > t.maxIdleTime {
-		return false
-	}
-
-	// Just check if connection object exists - we'll handle errors during RoundTrip
-	if conn.h2Conn == nil {
-		return false
-	}
-
-	return true
+	// A connection the server has sent GOAWAY on, or that has died, can open
+	// no more streams. Handing it out only fails the request and leans on the
+	// retry to recover, which a request whose body can't be replayed doesn't
+	// get, and servers send GOAWAY on idle connections routinely (#141).
+	//
+	// This must not be State(): that takes the HTTP/2 write lock, which a
+	// stalled upload on the same connection holds for as long as it is stuck,
+	// and every new request to the host would wait on it here, before
+	// RoundTrip, where its own deadline can't reach it. Closing takes only
+	// the connection's state lock.
+	return !h2Conn.Closing()
 }
 
 // isConnDestroyable reports whether a connection can be closed right now.
@@ -682,7 +727,7 @@ func (t *HTTP2Transport) isConnDestroyable(conn *persistentConn) bool {
 	if h2Conn == nil {
 		return true
 	}
-	if time.Since(conn.createdAt) > t.maxConnAge {
+	if t.maxConnAge > 0 && time.Since(conn.createdAt) > t.maxConnAge {
 		return true
 	}
 	return time.Since(lastUsedAt) > t.maxIdleTime
@@ -1053,6 +1098,9 @@ alpnCheck:
 			return nil
 		}(),
 	})
+	if t.canonicalHeadersForTest {
+		h2Transport.WireCaseResponseHeaders = false
+	}
 
 	h2Conn, err := h2Transport.NewClientConn(tlsConn)
 	if err != nil {

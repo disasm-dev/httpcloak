@@ -227,6 +227,7 @@ public sealed class Session : IDisposable
     /// <param name="withoutHighEntropyClientHints">Keep the always-on sec-ch-ua trio but drop only the high-entropy Client Hints advertised via Accept-CH, for the lifetime of the session (default: false)</param>
     /// <param name="disableEch">Skip the ECH (Encrypted Client Hello) HTTPS RR lookup. Saves ~15-20ms on first connect at the cost of the privacy bump ECH gives you (default: false)</param>
     /// <param name="disableHttp3">Disable HTTP/3 racing while keeping H1/H2 auto-negotiation. Use when QUIC is unreliable on the network or you need to bind to an address that can't UDP. Reachable indirectly via httpVersion="h2" too (default: false)</param>
+    /// <param name="http2MaxConnAge">Seconds after which an HTTP/2 connection takes no new requests and a fresh one is opened (default: null, five minutes). 0 turns the limit off. Requests already on it still finish.</param>
     /// <param name="tcpTtl">TCP/IP TTL override: 128=Windows, 64=Linux/macOS (default: null, no spoofing)</param>
     /// <param name="tcpMss">TCP Maximum Segment Size override: typically 1460 (default: null)</param>
     /// <param name="tcpWindowSize">TCP Window Size override: 64240=Windows, 65535=Linux/macOS (default: null)</param>
@@ -276,6 +277,7 @@ public sealed class Session : IDisposable
         int? tcpWindowSize = null,
         int? tcpWindowScale = null,
         bool? tcpDf = null,
+        int? http2MaxConnAge = null,
         string? cloudflareApiKey = null,
         string? cloudflareJwtSecret = null,
         string? cloudflareServiceUrl = null,
@@ -305,6 +307,7 @@ public sealed class Session : IDisposable
             EchConfigDomain = echConfigDomain,
             TlsOnly = tlsOnly,
             QuicIdleTimeout = quicIdleTimeout,
+            Http2MaxConnAge = http2MaxConnAge,
             LocalAddress = localAddress,
             KeyLogFile = keyLogFile,
             EnableSpeculativeTls = enableSpeculativeTls,
@@ -344,16 +347,39 @@ public sealed class Session : IDisposable
     private Dictionary<string, string> ApplyAuth(Dictionary<string, string>? headers, (string Username, string Password)? auth)
     {
         var effectiveAuth = auth ?? Auth;
-        headers ??= new Dictionary<string, string>();
+        // A copy, as the Python and Node.js bindings take: auth, cookies= and
+        // the body defaults that follow all write into what this returns, and
+        // writing into the caller's own dictionary carried them into the next
+        // request that reused it.
+        headers = CopyHeaders(headers);
 
         if (effectiveAuth != null)
         {
             var credentials = $"{effectiveAuth.Value.Username}:{effectiveAuth.Value.Password}";
             var base64 = Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(credentials));
+            // auth wins over an Authorization header in any spelling, and only one goes out.
+            foreach (var key in headers.Keys.Where(k => k.Equals("Authorization", StringComparison.OrdinalIgnoreCase)).ToList())
+                headers.Remove(key);
             headers["Authorization"] = $"Basic {base64}";
         }
 
         return headers;
+    }
+
+    /// <summary>
+    /// Set a header unless the caller already set it, in any spelling. The
+    /// transport sends one spelling of a header name and prefers the canonical
+    /// one, so a default added beside a caller's lowercase spelling would
+    /// replace the caller's value.
+    /// </summary>
+    private static void SetDefaultHeader(Dictionary<string, string> headers, string name, string value)
+    {
+        foreach (var key in headers.Keys)
+        {
+            if (key.Equals(name, StringComparison.OrdinalIgnoreCase))
+                return;
+        }
+        headers[name] = value;
     }
 
     /// <summary>
@@ -407,16 +433,29 @@ public sealed class Session : IDisposable
             return headers;
 
         var cookieStr = string.Join("; ", cookies.Select(c => $"{c.Key}={c.Value}"));
-        if (headers.TryGetValue("Cookie", out var existing) && !string.IsNullOrEmpty(existing))
+        // Add to a Cookie header in whatever spelling the caller gave it, so a
+        // "cookie" and these don't go out as two Cookie headers.
+        var key = headers.Keys.FirstOrDefault(k => k.Equals("Cookie", StringComparison.OrdinalIgnoreCase)) ?? "Cookie";
+        if (headers.TryGetValue(key, out var existing) && !string.IsNullOrEmpty(existing))
         {
-            headers["Cookie"] = $"{existing}; {cookieStr}";
+            headers[key] = $"{existing}; {cookieStr}";
         }
         else
         {
-            headers["Cookie"] = cookieStr;
+            headers[key] = cookieStr;
         }
         return headers;
     }
+
+    /// <summary>
+    /// A copy of the caller's headers, keeping their comparer, for the body
+    /// helpers to add a Content-Type to without writing into the caller's own
+    /// dictionary.
+    /// </summary>
+    private static Dictionary<string, string> CopyHeaders(Dictionary<string, string>? headers) =>
+        headers == null
+            ? new Dictionary<string, string>()
+            : new Dictionary<string, string>(headers, headers.Comparer);
 
     /// <summary>
     /// Auto-detect Content-Type from body when not explicitly set.
@@ -567,9 +606,8 @@ public sealed class Session : IDisposable
     /// <param name="timeout">Request timeout in seconds</param>
     public Response PostJson<T>(string url, T data, Dictionary<string, string>? headers = null, IEnumerable<KeyValuePair<string, string>>? parameters = null, Dictionary<string, string>? cookies = null, (string, string)? auth = null, int? timeout = null, string? fetchMode = null, bool? allowRedirects = null, bool disableConditionalCache = false, bool disableClientHints = false, bool disableHighEntropyClientHints = false, bool disableRedirectReferer = false, IEnumerable<KeyValuePair<string, string>>? exactHeaders = null, IEnumerable<string>? headerOrder = null)
     {
-        headers ??= new Dictionary<string, string>();
-        if (!headers.ContainsKey("Content-Type"))
-            headers["Content-Type"] = "application/json";
+        headers = CopyHeaders(headers);
+        SetDefaultHeader(headers, "Content-Type", "application/json");
 
         string body = JsonSerializer.Serialize(data, _relaxedJsonOptions);
         return Post(url, body, headers, parameters, cookies, auth, timeout, fetchMode, allowRedirects, disableConditionalCache, disableClientHints, disableHighEntropyClientHints, disableRedirectReferer, exactHeaders, headerOrder);
@@ -587,9 +625,8 @@ public sealed class Session : IDisposable
     /// <param name="timeout">Request timeout in seconds</param>
     public Response PostForm(string url, Dictionary<string, string> formData, Dictionary<string, string>? headers = null, IEnumerable<KeyValuePair<string, string>>? parameters = null, Dictionary<string, string>? cookies = null, (string, string)? auth = null, int? timeout = null, string? fetchMode = null)
     {
-        headers ??= new Dictionary<string, string>();
-        if (!headers.ContainsKey("Content-Type"))
-            headers["Content-Type"] = "application/x-www-form-urlencoded";
+        headers = CopyHeaders(headers);
+        SetDefaultHeader(headers, "Content-Type", "application/x-www-form-urlencoded");
 
         string body = string.Join("&", formData.Select(kvp => $"{Uri.EscapeDataString(kvp.Key)}={Uri.EscapeDataString(kvp.Value)}"));
         return Post(url, body, headers, parameters, cookies, auth, timeout, fetchMode);
@@ -627,7 +664,7 @@ public sealed class Session : IDisposable
 
         WriteStr($"--{boundary}--\r\n");
 
-        headers ??= new Dictionary<string, string>();
+        headers = CopyHeaders(headers);
         headers["Content-Type"] = $"multipart/form-data; boundary={boundary}";
         return Post(url, ms.ToArray(), headers, parameters, cookies, auth, timeout, fetchMode);
     }
@@ -718,9 +755,8 @@ public sealed class Session : IDisposable
     /// </summary>
     public Response PutJson<T>(string url, T data, Dictionary<string, string>? headers = null, IEnumerable<KeyValuePair<string, string>>? parameters = null, Dictionary<string, string>? cookies = null, (string, string)? auth = null, int? timeout = null, string? fetchMode = null, bool? allowRedirects = null, bool disableConditionalCache = false, bool disableClientHints = false, bool disableHighEntropyClientHints = false, bool disableRedirectReferer = false, IEnumerable<KeyValuePair<string, string>>? exactHeaders = null, IEnumerable<string>? headerOrder = null)
     {
-        headers ??= new Dictionary<string, string>();
-        if (!headers.ContainsKey("Content-Type"))
-            headers["Content-Type"] = "application/json";
+        headers = CopyHeaders(headers);
+        SetDefaultHeader(headers, "Content-Type", "application/json");
 
         string body = JsonSerializer.Serialize(data, _relaxedJsonOptions);
         return Put(url, body, headers, parameters, cookies, auth, timeout, fetchMode, allowRedirects, disableConditionalCache, disableClientHints, disableHighEntropyClientHints, disableRedirectReferer, exactHeaders, headerOrder);
@@ -756,9 +792,8 @@ public sealed class Session : IDisposable
     /// </summary>
     public Response PatchJson<T>(string url, T data, Dictionary<string, string>? headers = null, IEnumerable<KeyValuePair<string, string>>? parameters = null, Dictionary<string, string>? cookies = null, (string, string)? auth = null, int? timeout = null, string? fetchMode = null, bool? allowRedirects = null, bool disableConditionalCache = false, bool disableClientHints = false, bool disableHighEntropyClientHints = false, bool disableRedirectReferer = false, IEnumerable<KeyValuePair<string, string>>? exactHeaders = null, IEnumerable<string>? headerOrder = null)
     {
-        headers ??= new Dictionary<string, string>();
-        if (!headers.ContainsKey("Content-Type"))
-            headers["Content-Type"] = "application/json";
+        headers = CopyHeaders(headers);
+        SetDefaultHeader(headers, "Content-Type", "application/json");
 
         string body = JsonSerializer.Serialize(data, _relaxedJsonOptions);
         return Patch(url, body, headers, parameters, cookies, auth, timeout, fetchMode, allowRedirects, disableConditionalCache, disableClientHints, disableHighEntropyClientHints, disableRedirectReferer, exactHeaders, headerOrder);
@@ -1033,9 +1068,8 @@ public sealed class Session : IDisposable
     /// </summary>
     public Task<Response> PostJsonAsync<T>(string url, T data, Dictionary<string, string>? headers = null, IEnumerable<KeyValuePair<string, string>>? parameters = null, Dictionary<string, string>? cookies = null, (string, string)? auth = null, int? timeout = null, CancellationToken cancellationToken = default, string? fetchMode = null, bool? allowRedirects = null, bool disableConditionalCache = false, bool disableClientHints = false, bool disableHighEntropyClientHints = false, bool disableRedirectReferer = false, IEnumerable<KeyValuePair<string, string>>? exactHeaders = null, IEnumerable<string>? headerOrder = null)
     {
-        headers ??= new Dictionary<string, string>();
-        if (!headers.ContainsKey("Content-Type"))
-            headers["Content-Type"] = "application/json";
+        headers = CopyHeaders(headers);
+        SetDefaultHeader(headers, "Content-Type", "application/json");
 
         string body = JsonSerializer.Serialize(data, _relaxedJsonOptions);
         return PostAsync(url, body, headers, parameters, cookies, auth, timeout, cancellationToken, fetchMode, allowRedirects, disableConditionalCache, disableClientHints, disableHighEntropyClientHints, disableRedirectReferer, exactHeaders, headerOrder);
@@ -1046,9 +1080,8 @@ public sealed class Session : IDisposable
     /// </summary>
     public Task<Response> PostFormAsync(string url, Dictionary<string, string> formData, Dictionary<string, string>? headers = null, IEnumerable<KeyValuePair<string, string>>? parameters = null, Dictionary<string, string>? cookies = null, (string, string)? auth = null, int? timeout = null, CancellationToken cancellationToken = default, string? fetchMode = null)
     {
-        headers ??= new Dictionary<string, string>();
-        if (!headers.ContainsKey("Content-Type"))
-            headers["Content-Type"] = "application/x-www-form-urlencoded";
+        headers = CopyHeaders(headers);
+        SetDefaultHeader(headers, "Content-Type", "application/x-www-form-urlencoded");
 
         string body = string.Join("&", formData.Select(kvp => $"{Uri.EscapeDataString(kvp.Key)}={Uri.EscapeDataString(kvp.Value)}"));
         return PostAsync(url, body, headers, parameters, cookies, auth, timeout, cancellationToken, fetchMode);
@@ -1113,9 +1146,8 @@ public sealed class Session : IDisposable
     /// </summary>
     public Task<Response> PutJsonAsync<T>(string url, T data, Dictionary<string, string>? headers = null, IEnumerable<KeyValuePair<string, string>>? parameters = null, Dictionary<string, string>? cookies = null, (string, string)? auth = null, int? timeout = null, CancellationToken cancellationToken = default, string? fetchMode = null, bool? allowRedirects = null, bool disableConditionalCache = false, bool disableClientHints = false, bool disableHighEntropyClientHints = false, bool disableRedirectReferer = false, IEnumerable<KeyValuePair<string, string>>? exactHeaders = null, IEnumerable<string>? headerOrder = null)
     {
-        headers ??= new Dictionary<string, string>();
-        if (!headers.ContainsKey("Content-Type"))
-            headers["Content-Type"] = "application/json";
+        headers = CopyHeaders(headers);
+        SetDefaultHeader(headers, "Content-Type", "application/json");
 
         string body = JsonSerializer.Serialize(data, _relaxedJsonOptions);
         return PutAsync(url, body, headers, parameters, cookies, auth, timeout, cancellationToken, fetchMode, allowRedirects, disableConditionalCache, disableClientHints, disableHighEntropyClientHints, disableRedirectReferer, exactHeaders, headerOrder);
@@ -1138,9 +1170,8 @@ public sealed class Session : IDisposable
     /// </summary>
     public Task<Response> PatchJsonAsync<T>(string url, T data, Dictionary<string, string>? headers = null, IEnumerable<KeyValuePair<string, string>>? parameters = null, Dictionary<string, string>? cookies = null, (string, string)? auth = null, int? timeout = null, CancellationToken cancellationToken = default, string? fetchMode = null, bool? allowRedirects = null, bool disableConditionalCache = false, bool disableClientHints = false, bool disableHighEntropyClientHints = false, bool disableRedirectReferer = false, IEnumerable<KeyValuePair<string, string>>? exactHeaders = null, IEnumerable<string>? headerOrder = null)
     {
-        headers ??= new Dictionary<string, string>();
-        if (!headers.ContainsKey("Content-Type"))
-            headers["Content-Type"] = "application/json";
+        headers = CopyHeaders(headers);
+        SetDefaultHeader(headers, "Content-Type", "application/json");
 
         string body = JsonSerializer.Serialize(data, _relaxedJsonOptions);
         return PatchAsync(url, body, headers, parameters, cookies, auth, timeout, cancellationToken, fetchMode, allowRedirects, disableConditionalCache, disableClientHints, disableHighEntropyClientHints, disableRedirectReferer, exactHeaders, headerOrder);
@@ -1281,7 +1312,7 @@ public sealed class Session : IDisposable
 
         WriteStr($"--{boundary}--\r\n");
 
-        headers ??= new Dictionary<string, string>();
+        headers = CopyHeaders(headers);
         headers["Content-Type"] = $"multipart/form-data; boundary={boundary}";
 
         (string, string)? authTuple = auth.HasValue ? (auth.Value.Username, auth.Value.Password) : ((string, string)?)null;
@@ -2493,15 +2524,21 @@ public sealed class Session : IDisposable
     // the old shape too. PublicApiTests guards that.
     // ------------------------------------------------------------------
 
-    // The constructor as it stood before the datadome* parameters.
-    public Session(string preset, string? proxy, string? tcpProxy, string? udpProxy, int timeout, string httpVersion, bool verify, bool allowRedirects, int maxRedirects, int retry, int[]? retryOnStatus, int retryWaitMin, int retryWaitMax, bool preferIpv4, (string Username, string Password)? auth, Dictionary<string, string>? connectTo, string? echConfigDomain, bool tlsOnly, int quicIdleTimeout, string? localAddress, string? keyLogFile, bool enableSpeculativeTls, string? switchProtocol, bool withoutCookieJar, bool withoutConditionalCache, bool withoutClientHints, bool withoutHighEntropyClientHints, bool disableEch, bool disableHttp3, string? ja3, string? akamai, Dictionary<string, object>? extraFp, int? tcpTtl, int? tcpMss, int? tcpWindowSize, int? tcpWindowScale, bool? tcpDf, string? cloudflareApiKey, string? cloudflareJwtSecret, string? cloudflareServiceUrl)
-        : this(preset, proxy, tcpProxy, udpProxy, timeout, httpVersion, verify, allowRedirects, maxRedirects, retry, retryOnStatus, retryWaitMin, retryWaitMax, preferIpv4, auth, connectTo, echConfigDomain, tlsOnly, quicIdleTimeout, localAddress, keyLogFile, enableSpeculativeTls, switchProtocol, withoutCookieJar, withoutConditionalCache, withoutClientHints, withoutHighEntropyClientHints, disableEch, disableHttp3, ja3, akamai, extraFp, tcpTtl, tcpMss, tcpWindowSize, tcpWindowScale, tcpDf, cloudflareApiKey: cloudflareApiKey, cloudflareJwtSecret: cloudflareJwtSecret, cloudflareServiceUrl: cloudflareServiceUrl, datadomeApiKey: null, datadomeJwtSecret: null, datadomeServiceUrl: null)
+    // The 1.7.4 constructor, from before the cloudflare* and datadome* parameters.
+    public Session(string preset, string? proxy, string? tcpProxy, string? udpProxy, int timeout, string httpVersion, bool verify, bool allowRedirects, int maxRedirects, int retry, int[]? retryOnStatus, int retryWaitMin, int retryWaitMax, bool preferIpv4, (string Username, string Password)? auth, Dictionary<string, string>? connectTo, string? echConfigDomain, bool tlsOnly, int quicIdleTimeout, string? localAddress, string? keyLogFile, bool enableSpeculativeTls, string? switchProtocol, bool withoutCookieJar, bool withoutConditionalCache, bool withoutClientHints, bool withoutHighEntropyClientHints, bool disableEch, bool disableHttp3, string? ja3, string? akamai, Dictionary<string, object>? extraFp, int? tcpTtl, int? tcpMss, int? tcpWindowSize, int? tcpWindowScale, bool? tcpDf, int? http2MaxConnAge)
+        : this(preset, proxy, tcpProxy, udpProxy, timeout, httpVersion, verify, allowRedirects, maxRedirects, retry, retryOnStatus, retryWaitMin, retryWaitMax, preferIpv4, auth, connectTo, echConfigDomain, tlsOnly, quicIdleTimeout, localAddress, keyLogFile, enableSpeculativeTls, switchProtocol, withoutCookieJar, withoutConditionalCache, withoutClientHints, withoutHighEntropyClientHints, disableEch, disableHttp3, ja3, akamai, extraFp, tcpTtl, tcpMss, tcpWindowSize, tcpWindowScale, tcpDf, http2MaxConnAge, cloudflareApiKey: null)
     {
     }
 
-    // The constructor as it stood before the cloudflare* parameters.
-    public Session(string preset, string? proxy, string? tcpProxy, string? udpProxy, int timeout, string httpVersion, bool verify, bool allowRedirects, int maxRedirects, int retry, int[]? retryOnStatus, int retryWaitMin, int retryWaitMax, bool preferIpv4, (string Username, string Password)? auth, Dictionary<string, string>? connectTo, string? echConfigDomain, bool tlsOnly, int quicIdleTimeout, string? localAddress, string? keyLogFile, bool enableSpeculativeTls, string? switchProtocol, bool withoutCookieJar, bool withoutConditionalCache, bool withoutClientHints, bool withoutHighEntropyClientHints, bool disableEch, bool disableHttp3, string? ja3, string? akamai, Dictionary<string, object>? extraFp, int? tcpTtl, int? tcpMss, int? tcpWindowSize, int? tcpWindowScale, bool? tcpDf)
-        : this(preset, proxy, tcpProxy, udpProxy, timeout, httpVersion, verify, allowRedirects, maxRedirects, retry, retryOnStatus, retryWaitMin, retryWaitMax, preferIpv4, auth, connectTo, echConfigDomain, tlsOnly, quicIdleTimeout, localAddress, keyLogFile, enableSpeculativeTls, switchProtocol, withoutCookieJar, withoutConditionalCache, withoutClientHints, withoutHighEntropyClientHints, disableEch, disableHttp3, ja3, akamai, extraFp, tcpTtl, tcpMss, tcpWindowSize, tcpWindowScale, tcpDf, cloudflareApiKey: null, cloudflareJwtSecret: null, cloudflareServiceUrl: null)
+    // This fork's constructor from before http2MaxConnAge moved in.
+    public Session(string preset, string? proxy, string? tcpProxy, string? udpProxy, int timeout, string httpVersion, bool verify, bool allowRedirects, int maxRedirects, int retry, int[]? retryOnStatus, int retryWaitMin, int retryWaitMax, bool preferIpv4, (string Username, string Password)? auth, Dictionary<string, string>? connectTo, string? echConfigDomain, bool tlsOnly, int quicIdleTimeout, string? localAddress, string? keyLogFile, bool enableSpeculativeTls, string? switchProtocol, bool withoutCookieJar, bool withoutConditionalCache, bool withoutClientHints, bool withoutHighEntropyClientHints, bool disableEch, bool disableHttp3, string? ja3, string? akamai, Dictionary<string, object>? extraFp, int? tcpTtl, int? tcpMss, int? tcpWindowSize, int? tcpWindowScale, bool? tcpDf, string? cloudflareApiKey, string? cloudflareJwtSecret, string? cloudflareServiceUrl, string? datadomeApiKey, string? datadomeJwtSecret, string? datadomeServiceUrl)
+        : this(preset, proxy, tcpProxy, udpProxy, timeout, httpVersion, verify, allowRedirects, maxRedirects, retry, retryOnStatus, retryWaitMin, retryWaitMax, preferIpv4, auth, connectTo, echConfigDomain, tlsOnly, quicIdleTimeout, localAddress, keyLogFile, enableSpeculativeTls, switchProtocol, withoutCookieJar, withoutConditionalCache, withoutClientHints, withoutHighEntropyClientHints, disableEch, disableHttp3, ja3, akamai, extraFp, tcpTtl, tcpMss, tcpWindowSize, tcpWindowScale, tcpDf, http2MaxConnAge: null, cloudflareApiKey: cloudflareApiKey, cloudflareJwtSecret: cloudflareJwtSecret, cloudflareServiceUrl: cloudflareServiceUrl, datadomeApiKey: datadomeApiKey, datadomeJwtSecret: datadomeJwtSecret, datadomeServiceUrl: datadomeServiceUrl)
+    {
+    }
+
+    // The constructor as it stood before the datadome* parameters.
+    public Session(string preset, string? proxy, string? tcpProxy, string? udpProxy, int timeout, string httpVersion, bool verify, bool allowRedirects, int maxRedirects, int retry, int[]? retryOnStatus, int retryWaitMin, int retryWaitMax, bool preferIpv4, (string Username, string Password)? auth, Dictionary<string, string>? connectTo, string? echConfigDomain, bool tlsOnly, int quicIdleTimeout, string? localAddress, string? keyLogFile, bool enableSpeculativeTls, string? switchProtocol, bool withoutCookieJar, bool withoutConditionalCache, bool withoutClientHints, bool withoutHighEntropyClientHints, bool disableEch, bool disableHttp3, string? ja3, string? akamai, Dictionary<string, object>? extraFp, int? tcpTtl, int? tcpMss, int? tcpWindowSize, int? tcpWindowScale, bool? tcpDf, string? cloudflareApiKey, string? cloudflareJwtSecret, string? cloudflareServiceUrl)
+        : this(preset, proxy, tcpProxy, udpProxy, timeout, httpVersion, verify, allowRedirects, maxRedirects, retry, retryOnStatus, retryWaitMin, retryWaitMax, preferIpv4, auth, connectTo, echConfigDomain, tlsOnly, quicIdleTimeout, localAddress, keyLogFile, enableSpeculativeTls, switchProtocol, withoutCookieJar, withoutConditionalCache, withoutClientHints, withoutHighEntropyClientHints, disableEch, disableHttp3, ja3, akamai, extraFp, tcpTtl, tcpMss, tcpWindowSize, tcpWindowScale, tcpDf, http2MaxConnAge: null, cloudflareApiKey: cloudflareApiKey, cloudflareJwtSecret: cloudflareJwtSecret, cloudflareServiceUrl: cloudflareServiceUrl, datadomeApiKey: null, datadomeJwtSecret: null, datadomeServiceUrl: null)
     {
     }
 
@@ -2716,6 +2753,12 @@ public sealed class Session : IDisposable
 
     public Task<Response> PostMultipartAsync(string url, Dictionary<string, string>? fields, Dictionary<string, MultipartFile>? files, Dictionary<string, string>? headers, IEnumerable<KeyValuePair<string, string>>? parameters, Dictionary<string, string>? cookies, (string Username, string Password)? auth, int? timeout, CancellationToken cancellationToken, string? fetchMode, bool? allowRedirects, bool disableConditionalCache, bool disableClientHints, bool disableHighEntropyClientHints, bool disableRedirectReferer)
         => PostMultipartAsync(url, fields, files, headers, parameters, cookies, auth, timeout, cancellationToken, fetchMode, allowRedirects, disableConditionalCache, disableClientHints, disableHighEntropyClientHints, disableRedirectReferer, exactHeaders: null, headerOrder: null);
+
+    // The 1.7.3 constructor, from before http2MaxConnAge.
+    public Session(string preset, string? proxy, string? tcpProxy, string? udpProxy, int timeout, string httpVersion, bool verify, bool allowRedirects, int maxRedirects, int retry, int[]? retryOnStatus, int retryWaitMin, int retryWaitMax, bool preferIpv4, (string Username, string Password)? auth, Dictionary<string, string>? connectTo, string? echConfigDomain, bool tlsOnly, int quicIdleTimeout, string? localAddress, string? keyLogFile, bool enableSpeculativeTls, string? switchProtocol, bool withoutCookieJar, bool withoutConditionalCache, bool withoutClientHints, bool withoutHighEntropyClientHints, bool disableEch, bool disableHttp3, string? ja3, string? akamai, Dictionary<string, object>? extraFp, int? tcpTtl, int? tcpMss, int? tcpWindowSize, int? tcpWindowScale, bool? tcpDf)
+        : this(preset, proxy, tcpProxy, udpProxy, timeout, httpVersion, verify, allowRedirects, maxRedirects, retry, retryOnStatus, retryWaitMin, retryWaitMax, preferIpv4, auth, connectTo, echConfigDomain, tlsOnly, quicIdleTimeout, localAddress, keyLogFile, enableSpeculativeTls, switchProtocol, withoutCookieJar, withoutConditionalCache, withoutClientHints, withoutHighEntropyClientHints, disableEch, disableHttp3, ja3, akamai, extraFp, tcpTtl, tcpMss, tcpWindowSize, tcpWindowScale, tcpDf, http2MaxConnAge: null)
+    {
+    }
 
 }
 
@@ -3563,6 +3606,27 @@ public static class Presets
     public const string Chrome155IOS = "chrome-155-ios";
     public const string Chrome155Android = "chrome-155-android";
 
+    // Chrome 156 (headers only over 155)
+    public const string Chrome156 = "chrome-156";
+    public const string Chrome156Windows = "chrome-156-windows";
+    public const string Chrome156Linux = "chrome-156-linux";
+    public const string Chrome156MacOS = "chrome-156-macos";
+    public const string Chrome156Android = "chrome-156-android";
+
+    // Chrome 157 (headers only over 156)
+    public const string Chrome157 = "chrome-157";
+    public const string Chrome157Windows = "chrome-157-windows";
+    public const string Chrome157Linux = "chrome-157-linux";
+    public const string Chrome157MacOS = "chrome-157-macos";
+    public const string Chrome157Android = "chrome-157-android";
+
+    // Chrome 158 (headers only over 157)
+    public const string Chrome158 = "chrome-158";
+    public const string Chrome158Windows = "chrome-158-windows";
+    public const string Chrome158Linux = "chrome-158-linux";
+    public const string Chrome158MacOS = "chrome-158-macos";
+    public const string Chrome158Android = "chrome-158-android";
+
     // Chrome 152 (trust anchors, plus a greased signature algorithm on TCP)
     public const string Chrome152 = "chrome-152";
     public const string Chrome152Windows = "chrome-152-windows";
@@ -3663,6 +3727,7 @@ public static class Presets
     public const string Safari18 = "safari-18";
     public const string Safari17Ios = "safari-17-ios";
     public const string Safari18Ios = "safari-18-ios";
+    public const string Safari26Ios = "safari-26-ios";
     public const string SafariLatestIos = "safari-latest-ios";
 
     // Backwards compatibility aliases (old "ios-chrome" / "android-chrome" naming)
@@ -3675,6 +3740,7 @@ public static class Presets
     public const string IosChromeLatest = ChromeLatestIos;
     public const string IosSafari17 = Safari17Ios;
     public const string IosSafari18 = Safari18Ios;
+    public const string IosSafari26 = Safari26Ios;
     public const string IosSafariLatest = SafariLatestIos;
     public const string AndroidChrome143 = Chrome143Android;
     public const string AndroidChrome144 = Chrome144Android;
@@ -3869,6 +3935,10 @@ internal class SessionConfig
     [JsonPropertyName("quic_idle_timeout")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
     public int QuicIdleTimeout { get; set; }
+
+    [JsonPropertyName("http2_max_conn_age")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public int? Http2MaxConnAge { get; set; }
 
     [JsonPropertyName("local_address")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
@@ -4353,13 +4423,15 @@ public sealed class HttpCloakHandler : DelegatingHandler
     /// <param name="udpProxy">Upstream proxy URL for UDP protocols (HTTP/3 via MASQUE)</param>
     /// <param name="timeout">Request timeout in seconds (default: 30)</param>
     /// <param name="maxConnections">Maximum concurrent connections (default: 1000)</param>
+    /// <param name="verify">Verify the certificates of the sites requests go to (default: true). false is for testing against a self-signed certificate.</param>
     public HttpCloakHandler(
         string preset = "chrome-latest",
         string? proxy = null,
         string? tcpProxy = null,
         string? udpProxy = null,
         int timeout = 30,
-        int maxConnections = 1000)
+        int maxConnections = 1000,
+        bool verify = true)
     {
         _proxy = new LocalProxy(
             port: 0,
@@ -4367,15 +4439,26 @@ public sealed class HttpCloakHandler : DelegatingHandler
             timeout: timeout,
             maxConnections: maxConnections,
             tcpProxy: tcpProxy ?? proxy,
-            udpProxy: udpProxy ?? proxy);
+            udpProxy: udpProxy ?? proxy,
+            verify: verify);
         _ownsProxy = true;
 
         // Set up inner handler to use the local proxy
-        InnerHandler = new HttpClientHandler
+        var inner = new HttpClientHandler
         {
             Proxy = _proxy.CreateWebProxy(),
             UseProxy = true
         };
+        if (!verify)
+            inner.ServerCertificateCustomValidationCallback = HttpClientHandler.DangerousAcceptAnyServerCertificateValidator;
+        InnerHandler = inner;
+    }
+
+    // The 1.7.3 constructor, from before verify. Kept so binaries compiled
+    // against it still resolve; see the forwarders at the end of Session.cs.
+    public HttpCloakHandler(string preset, string? proxy, string? tcpProxy, string? udpProxy, int timeout, int maxConnections)
+        : this(preset, proxy, tcpProxy, udpProxy, timeout, maxConnections, verify: true)
+    {
     }
 
     /// <summary>

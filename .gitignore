@@ -49,6 +49,7 @@ internal_tests/
 # ...except real regression locks, which must ship. The blanket rule above
 # exists to keep throwaway root-level scratch tests out of the tree.
 !/local_proxy_gzip_test.go
+!/local_proxy_verify_test.go
 !/rootcas_verify_test.go
 !/redirect_test.go
 !/extra_fp_test.go
@@ -61,6 +62,9 @@ internal_tests/
 !/gzip_session_test.go
 !/datadome_session_test.go
 !/datadome_live_test.go
+!/cookie_max_age_stream_test.go
+!/http2_max_conn_age_test.go
+!/request_headers_reuse_test.go
 
 # Python regression locks. The repo tracked no Python tests until the fast-path
 # JSON body bug (post_fast/put_fast crashed outright on json= with no headers)
@@ -70,9 +74,11 @@ internal_tests/
 !/tests/python/test_json_alias.py
 !/tests/python/test_session_cache_backend.py
 !/tests/python/test_configure.py
+!/tests/python/test_header_spelling.py
 # Node regression locks, on the same terms.
 !/tests/nodejs/test_session_cache_concurrency.js
 !/tests/nodejs/test_configure.js
+!/tests/nodejs/test_header_spelling.js
 
 # Local workspace config (points at machine-local fork paths)
 go.work
@@ -109,3 +115,7 @@ cmd/
 debugs/
 issues_reply/
 library_locations.md
+
+# Saved session transcripts land in the repo root as <date>-<time>-<title>.txt.
+# They are notes, never part of the project.
+/20??-??-??-*.txt

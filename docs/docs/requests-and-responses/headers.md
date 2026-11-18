@@ -15,11 +15,11 @@ DevTools doesn't show you header order, so you're flying blind there. Hit [tls.p
 
 ## What ships by default
 
-Every preset carries its own browser header set. For `chrome-latest` on a Linux host (which resolves to `chrome-155-linux`), a navigation goes out as:
+Every preset carries its own browser header set. For `chrome-latest` on a Linux host (which resolves to `chrome-158-linux`), a navigation goes out as:
 
 | Position | Header | Example value |
 |---|---|---|
-| 1 | `sec-ch-ua` | `"Google Chrome";v="155", "Chromium";v="155", "Not(A:Brand";v="24"` |
+| 1 | `sec-ch-ua` | `"Chromium";v="158", "Not.A/Brand";v="24", "Google Chrome";v="158"` |
 | 2 | `sec-ch-ua-mobile` | `?0` |
 | 3 | `sec-ch-ua-platform` | `"Linux"` |
 | 4 | `upgrade-insecure-requests` | `1` |
@@ -203,7 +203,7 @@ The reserved-slot bit is what matters. The preset's full HPACK position table, s
 
 ## Things that don't behave the way you'd expect
 
-- **Casing.** HTTP/2 and HTTP/3 are lowercase on the wire, and the preset stores everything lowercase. Pass `User-Agent: foo` and the lib normalizes it to `user-agent: foo` for H2/H3. On HTTP/1.1, casing is preserved per the request map.
+- **Casing.** HTTP/2 and HTTP/3 are lowercase on the wire, and the preset stores everything lowercase. Pass `User-Agent: foo` and the lib normalizes it to `user-agent: foo` for H2/H3. On HTTP/1.1 a header of your own goes out spelled exactly as you passed it, as Chrome sends a header a page set: `x-custom-trace` stays lowercase and `X-Requested-With` stays Title-Cased. Names the browser writes itself keep the browser's casing whatever you pass: the ones a page cannot set (`User-Agent`, `Cookie`, `Referer`, `Origin`, `DNT`, every `Sec-*`), the ones the presets place (`Accept`, `Content-Type`, `Cache-Control` and the rest), and `Range` and `If-Range`, which Chrome writes itself for media and resumed downloads.
 - **Removing a preset header.** Set it to `""` in your headers map and the lib won't emit it. Useful for dropping `Accept-Encoding` or similar defaults.
 - **Custom headers vs each other.** Custom headers the preset reserves no slot for are emitted after the preset's own headers, sorted by name. Sorting is deliberate rather than a fallback: the request header map has no insertion order to preserve in the first place, and ranging over it directly — which is what the library used to do — put a different order on the wire for every request, which is its own fingerprint. Sorted is also what a browser sends for `fetch()`, since the Fetch standard sorts field names before they ever reach the network stack.
 - **Cookie.** Don't set `Cookie` directly unless you've thought it through. The session jar handles it. See [Per-Request Cookies](../cookies-and-state/per-request-cookies) for the override path.

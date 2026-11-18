@@ -162,8 +162,9 @@ func ResetInitialRTT() {}
 // AdditionalTransportParamsForPreset returns per-connection additional QUIC
 // transport params appropriate for the given preset. For Chrome presets that is
 // version_information (0x11) and google_connection_options (0x3128). For
-// non-Chrome presets (e.g. Firefox) it returns nil so these Chrome-specific
-// params are not sent.
+// non-Chrome presets (e.g. Firefox) it returns an empty map so these
+// Chrome-specific params are not sent. A preset whose HTTP/3 hello is a capture
+// sends whichever of the two the capture carries.
 //
 // The ctx/host/port parameters are unused and retained for API compatibility;
 // they previously drove the initial_rtt probe.
@@ -171,6 +172,18 @@ func AdditionalTransportParamsForPreset(preset *fingerprint.Preset, _ context.Co
 	if preset == nil {
 		return nil
 	}
+
+	captured, fromCapture, err := fingerprint.QUICCaptureTransportParameters(preset)
+	if err != nil {
+		// Load refuses a capture this cannot read, so only a preset assembled
+		// in Go gets here, and its hello fails to resolve on the same bytes.
+		// Nothing the capture cannot vouch for is sent.
+		return map[uint64][]byte{}
+	}
+	if fromCapture {
+		return chromeTransportParamsFromCapture(preset, captured)
+	}
+
 	if !presetIsChromeQUIC(preset) {
 		// Empty, NOT nil. quic-go treats a nil additional-parameter map as "fall
 		// back to the process-global set", and MeasureAndSetInitialRTT writes
@@ -181,6 +194,36 @@ func AdditionalTransportParamsForPreset(preset *fingerprint.Preset, _ context.Co
 		return map[uint64][]byte{}
 	}
 	return BuildChromeTransportParamsFor(preset.H3QUICConnectionOptions())
+}
+
+// chromeTransportParamsFromCapture sends each Chrome parameter the captured
+// hello carries, and no other.
+//
+// Presence is read off the capture, but version_information is still built
+// fresh: its GREASE label is drawn per connection, and replaying the captured
+// one would pin it. google_connection_options takes the preset's
+// quic_connection_options when that is set, and the captured tags otherwise,
+// since Chrome's "ORIG" default is a guess the capture has already answered.
+func chromeTransportParamsFromCapture(preset *fingerprint.Preset, captured map[uint64][]byte) map[uint64][]byte {
+	var connectionOptions []string
+	if preset.H3Config != nil && preset.H3Config.QUICConnectionOptions != nil {
+		connectionOptions = *preset.H3Config.QUICConnectionOptions
+	} else {
+		tags := captured[tpGoogleConnectionOptions]
+		connectionOptions = []string{}
+		for len(tags) >= 4 {
+			connectionOptions = append(connectionOptions, string(tags[:4]))
+			tags = tags[4:]
+		}
+	}
+
+	params := BuildChromeTransportParamsFor(connectionOptions)
+	for id := range params {
+		if _, ok := captured[id]; !ok {
+			delete(params, id)
+		}
+	}
+	return params
 }
 
 // presetIsChromeQUIC reports whether a preset impersonates a Chromium-based
@@ -199,6 +242,11 @@ func AdditionalTransportParamsForPreset(preset *fingerprint.Preset, _ context.Co
 // desktop and Android Chrome presets, and something else (or empty) for
 // Firefox, Safari and the WebKit-based iOS Chrome presets, which really do not
 // send these.
+//
+// A preset whose HTTP/3 hello is a capture never asks. Loading a capture clears
+// the identity it replaces, so this would answer from whatever identity was
+// left, and the capture itself says which parameters the client sends; see
+// chromeTransportParamsFromCapture.
 func presetIsChromeQUIC(preset *fingerprint.Preset) bool {
 	if preset.QUICClientHelloID.Client != "" {
 		return preset.QUICClientHelloID.Client == "Chrome"
@@ -273,8 +321,6 @@ type HTTP3Transport struct {
 	// resolution fails. Dials go through getSpecForHost, which builds a fresh
 	// one per connection; see FreshShuffleSeed for why that matters.
 	cachedClientHelloSpec *utls.ClientHelloSpec
-	// PSK variant of the spec for session resumption (includes pre_shared_key extension)
-	cachedClientHelloSpecPSK *utls.ClientHelloSpec
 
 	// Separate cached spec for inner MASQUE connections (not shared with outer)
 	cachedClientHelloSpecInner *utls.ClientHelloSpec
@@ -430,16 +476,24 @@ func (t *HTTP3Transport) SetDisableECH(disable bool) {
 // hasSessionForHost checks if there's a cached TLS session for the given host
 // This is used to determine whether to use PSK spec (for resumption) or regular spec
 func (t *HTTP3Transport) hasSessionForHost(host string) bool {
+	return t.sessionForHost(host) != nil
+}
+
+// sessionForHost returns the cached ticket a dial to host will resume, or nil.
+func (t *HTTP3Transport) sessionForHost(host string) *utls.ClientSessionState {
 	if t.sessionCache == nil {
-		return false
+		return nil
 	}
 	// Session key format is just the server name in TLS 1.3
 	cache, ok := t.sessionCache.(*PersistableSessionCache)
 	if !ok {
-		return false
+		return nil
 	}
-	_, found := cache.Get(host)
-	return found
+	session, found := cache.Get(host)
+	if !found {
+		return nil
+	}
+	return session
 }
 
 // getSpecForHost returns a FRESH ClientHelloSpec for this dial. utls ApplyPreset
@@ -451,9 +505,9 @@ func (t *HTTP3Transport) hasSessionForHost(host string) bool {
 // connections from one session carry a byte-identical order, which is visible
 // without any statistics at all. See fingerprint.FreshShuffleSeed.
 //
-// The PSK variant (which carries the early_data + pre_shared_key extensions) is
-// used only when there is a cached session to resume; Chrome does not send
-// early_data on a fresh connection.
+// The PSK variant (which carries pre_shared_key, and early_data when the ticket
+// allows 0-RTT) is used only when there is a cached session to resume; Chrome
+// does not send early_data on a fresh connection.
 func (t *HTTP3Transport) getSpecForHost(host string) *utls.ClientHelloSpec {
 	spec, err := t.resolveQUICSpec(host)
 	if err != nil {
@@ -474,50 +528,14 @@ func (t *HTTP3Transport) getSpecForHost(host string) *utls.ClientHelloSpec {
 // next time a source cannot be used it is visible rather than inferred from a
 // fingerprint that looks wrong.
 func (t *HTTP3Transport) resolveQUICSpec(host string) (*utls.ClientHelloSpec, error) {
-	wantPSK := t.preset.QUICPSKClientHelloID.Client != "" && t.hasSessionForHost(host)
+	ticket := t.sessionForHost(host)
+	wantPSK := fingerprint.HasQUICPSKVariant(t.preset) && ticket != nil
 	spec, _, err := fingerprint.ResolveQUICClientHelloSpec(t.preset, wantPSK, fingerprint.FreshShuffleSeed())
-	if err == nil && spec != nil && wantPSK && !t.earlyDataAllowed(host) {
-		spec.Extensions = withoutEarlyData(spec.Extensions)
+	if err == nil && wantPSK {
+		// The resuming hello offers early_data only on a ticket that allows it.
+		h3build.DropEarlyDataUnlessAllowed(spec, t.preset, ticket)
 	}
 	return spec, err
-}
-
-// earlyDataAllowed reports whether resuming host may offer 0-RTT.
-//
-// BoringSSL offers early data only on a session whose ticket allowed it
-// (early_data_offered requires ticket_max_early_data), so when a server's ticket
-// says no, Chrome's resumed ClientHello carries no early_data at all. Cloudflare
-// issues exactly that ticket on a zone with 0-RTT switched off. The PSK spec
-// offered it regardless, the server rejected the 0-RTT, and the request needed
-// a retry.
-func (t *HTTP3Transport) earlyDataAllowed(host string) bool {
-	cache, ok := t.sessionCache.(*PersistableSessionCache)
-	if !ok {
-		return false
-	}
-	cs, found := cache.Get(host)
-	if !found || cs == nil {
-		return false
-	}
-	_, state, err := cs.ResumptionState()
-	return err == nil && state != nil && state.EarlyData
-}
-
-// withoutEarlyData returns exts without the early_data extension (42).
-func withoutEarlyData(exts []utls.TLSExtension) []utls.TLSExtension {
-	out := make([]utls.TLSExtension, 0, len(exts))
-	for _, e := range exts {
-		switch x := e.(type) {
-		case *utls.FakeEarlyDataExtension:
-			continue
-		case *utls.GenericExtension:
-			if x.Id == 42 {
-				continue
-			}
-		}
-		out = append(out, e)
-	}
-	return out
 }
 
 // noteSpecFailure records why the QUIC hello could not be built. There is no
@@ -600,16 +618,6 @@ func NewHTTP3TransportWithTransportConfig(preset *fingerprint.Preset, dnsCache *
 		}
 	}
 
-	// Also cache the PSK spec for session resumption (includes pre_shared_key extension)
-	// Chrome uses a different TLS extension set when resuming with PSK
-	if preset.QUICPSKClientHelloID.Client != "" {
-		if pskSpec, err := utls.UTLSIdToSpecWithSeed(preset.QUICPSKClientHelloID, fingerprint.FreshShuffleSeed()); err == nil {
-			fingerprint.ApplySignatureAlgorithms(pskSpec.Extensions, preset.QUICSignatureAlgorithms)
-			fingerprint.ApplyQUICTrustAnchors(&pskSpec.Extensions, preset)
-			t.cachedClientHelloSpecPSK = &pskSpec
-		}
-	}
-
 	// Determine key log writer - config override or global
 	var keyLogWriter io.Writer
 	if config != nil && config.KeyLogWriter != nil {
@@ -629,7 +637,7 @@ func NewHTTP3TransportWithTransportConfig(preset *fingerprint.Preset, dnsCache *
 		TicketAgeWholeSeconds: preset.TLSTicketAgeWholeSeconds(),
 	}
 	t.tlsVerify.Apply(t.tlsConfig)
-	if t.cachedClientHelloSpecPSK != nil {
+	if fingerprint.HasQUICPSKVariant(t.preset) {
 		t.tlsConfig.ClientSessionCache = t.sessionCache
 	}
 
@@ -731,15 +739,6 @@ func NewHTTP3TransportWithConfig(preset *fingerprint.Preset, dnsCache *dns.Cache
 		}
 	}
 
-	// Also cache the PSK spec for session resumption (includes pre_shared_key extension)
-	if preset.QUICPSKClientHelloID.Client != "" {
-		if pskSpec, err := utls.UTLSIdToSpecWithSeed(preset.QUICPSKClientHelloID, fingerprint.FreshShuffleSeed()); err == nil {
-			fingerprint.ApplySignatureAlgorithms(pskSpec.Extensions, preset.QUICSignatureAlgorithms)
-			fingerprint.ApplyQUICTrustAnchors(&pskSpec.Extensions, preset)
-			t.cachedClientHelloSpecPSK = &pskSpec
-		}
-	}
-
 	// Determine key log writer - config override or global
 	var keyLogWriter io.Writer
 	if config != nil && config.KeyLogWriter != nil {
@@ -759,7 +758,7 @@ func NewHTTP3TransportWithConfig(preset *fingerprint.Preset, dnsCache *dns.Cache
 		TicketAgeWholeSeconds: preset.TLSTicketAgeWholeSeconds(),
 	}
 	t.tlsVerify.Apply(t.tlsConfig)
-	if t.cachedClientHelloSpecPSK != nil {
+	if fingerprint.HasQUICPSKVariant(t.preset) {
 		t.tlsConfig.ClientSessionCache = t.sessionCache
 	}
 
@@ -860,12 +859,6 @@ func NewHTTP3TransportWithMASQUE(preset *fingerprint.Preset, dnsCache *dns.Cache
 
 	// Also cache PSK specs for session resumption (includes pre_shared_key extension)
 	if preset.QUICPSKClientHelloID.Client != "" {
-		// Outer PSK spec
-		if pskSpec, err := utls.UTLSIdToSpecWithSeed(preset.QUICPSKClientHelloID, fingerprint.FreshShuffleSeed()); err == nil {
-			fingerprint.ApplySignatureAlgorithms(pskSpec.Extensions, preset.QUICSignatureAlgorithms)
-			fingerprint.ApplyQUICTrustAnchors(&pskSpec.Extensions, preset)
-			t.cachedClientHelloSpecPSK = &pskSpec
-		}
 		// Inner PSK spec for MASQUE connections
 		if innerPskSpec, err := utls.UTLSIdToSpecWithSeed(preset.QUICPSKClientHelloID, fingerprint.FreshShuffleSeed()); err == nil {
 			fingerprint.ApplySignatureAlgorithms(innerPskSpec.Extensions, preset.QUICSignatureAlgorithms)
@@ -893,7 +886,7 @@ func NewHTTP3TransportWithMASQUE(preset *fingerprint.Preset, dnsCache *dns.Cache
 		TicketAgeWholeSeconds: preset.TLSTicketAgeWholeSeconds(),
 	}
 	t.tlsVerify.Apply(t.tlsConfig)
-	if t.cachedClientHelloSpecPSK != nil {
+	if fingerprint.HasQUICPSKVariant(t.preset) {
 		t.tlsConfig.ClientSessionCache = t.sessionCache
 	}
 
@@ -974,7 +967,7 @@ func (t *HTTP3Transport) dialQUICWithMASQUE(ctx context.Context, addr string, tl
 	tlsCfgCopy.ServerName = host
 	// Clone() doesn't preserve ClientSessionCache, restore it for session resumption
 	// Only if we have PSK spec to prevent TOCTOU race
-	if t.cachedClientHelloSpecPSK != nil {
+	if fingerprint.HasQUICPSKVariant(t.preset) {
 		tlsCfgCopy.ClientSessionCache = t.sessionCache
 	}
 
@@ -999,7 +992,7 @@ func (t *HTTP3Transport) dialQUICWithMASQUE(ctx context.Context, addr string, tl
 	// - TransportParameterOrder: WORKS - Chrome transport param ordering
 
 	// Switch to PSK ClientHelloSpec for resumed connections
-	// If there's a cached session, use PSK spec (includes early_data + pre_shared_key extensions)
+	// With a cached session, use the PSK spec: pre_shared_key, plus early_data when the ticket allows it
 	// This tells utls to actually load and use the cached session for 0-RTT
 	innerSpec := t.getInnerSpecForHost(host)
 
@@ -1133,7 +1126,7 @@ func (t *HTTP3Transport) dialQUICWithProxy(ctx context.Context, addr string, tls
 	// Clone TLS config — ServerName is the actual host (not connectHost)
 	tlsCfgCopy := t.tlsConfig.Clone()
 	tlsCfgCopy.ServerName = host
-	if t.cachedClientHelloSpecPSK != nil {
+	if fingerprint.HasQUICPSKVariant(t.preset) {
 		tlsCfgCopy.ClientSessionCache = t.sessionCache
 	}
 
@@ -1616,7 +1609,7 @@ func (t *HTTP3Transport) dialQUIC(ctx context.Context, addr string, tlsCfg *tls.
 	tlsCfgCopy.ServerName = host
 	// Clone() doesn't preserve ClientSessionCache, restore it for session resumption
 	// Only if we have PSK spec to prevent TOCTOU race
-	if t.cachedClientHelloSpecPSK != nil {
+	if fingerprint.HasQUICPSKVariant(t.preset) {
 		tlsCfgCopy.ClientSessionCache = t.sessionCache
 	}
 
@@ -1627,7 +1620,7 @@ func (t *HTTP3Transport) dialQUIC(ctx context.Context, addr string, tlsCfg *tls.
 	}
 
 	// Switch to PSK ClientHelloSpec for resumed connections
-	// If there's a cached session, use PSK spec (includes early_data + pre_shared_key extensions)
+	// With a cached session, use the PSK spec: pre_shared_key, plus early_data when the ticket allows it
 	// This matches real Chrome's behavior for 0-RTT resumption
 	// Note: The PSK spec (HelloChrome_143_QUIC_PSK) has the pre_shared_key extension which
 	// tells utls to actually load and use the cached session for 0-RTT
@@ -1648,29 +1641,32 @@ func (t *HTTP3Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 	dialsBefore := t.dialCount
 	t.mu.Unlock()
 
-	// Use ordered headers if available (HTTP/3 header order matters for fingerprinting)
-	// Skip if in TLS-only mode (headers handled by applyPresetHeaders which respects tlsOnly)
-	tlsOnly := t.config != nil && t.config.TLSOnly
-	if !tlsOnly {
-		if len(t.preset.HeaderOrder) > 0 {
-			// Apply headers in the specified order
-			for _, hp := range t.preset.HeaderOrder {
-				if req.Header.Get(hp.Key) == "" {
-					req.Header.Set(hp.Key, hp.Value)
-				}
-			}
-		} else {
-			// Fallback to unordered headers map
-			for key, value := range t.preset.Headers {
-				if req.Header.Get(key) == "" {
-					req.Header.Set(key, value)
-				}
+	// No preset header is filled in here, as none is on HTTP/1.1 or HTTP/2.
+	// Both callers, Transport and client.Client, hand over a request whose
+	// headers they have already built, and a header missing from it was taken
+	// off on purpose: a fetch drops Sec-Fetch-User and
+	// Upgrade-Insecure-Requests, DisableClientHints drops the sec-ch-ua trio,
+	// TLS-only drops all of them. This used to put back every preset header
+	// the request did not carry, with the preset's navigation value, so on
+	// HTTP/3 alone a fetch went out with navigation headers and a TLS-only
+	// request with the whole set. Only a transport-wide TLS-only setting
+	// stopped it, never a per-request one.
+	//
+	// User-Agent is the one exception. With no user-agent field at all,
+	// quic-go writes its own "quic-go HTTP/3", where HTTP/2 sends the
+	// preset's, so an exact-headers request without one would name the
+	// library. TLS-only requests are left alone: the pipeline gives them an
+	// empty User-Agent precisely so nothing is sent, and that key is present.
+	if t.config == nil || !t.config.TLSOnly {
+		hasUA := false
+		for key := range req.Header {
+			if strings.EqualFold(key, "User-Agent") {
+				hasUA = true
+				break
 			}
 		}
-
-		// Set User-Agent if not set
-		if req.Header.Get("User-Agent") == "" {
-			req.Header.Set("User-Agent", t.preset.UserAgent)
+		if !hasUA {
+			req.Header["User-Agent"] = []string{t.preset.UserAgent}
 		}
 	}
 

@@ -3,8 +3,11 @@ package pool
 import (
 	"os"
 	"regexp"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/sardanioss/httpcloak/fingerprint"
 )
 
 // Regression locks for two defects introduced while porting the #83
@@ -145,5 +148,32 @@ func TestMaxConnsAccountingCountsBusyButLiveConns(t *testing.T) {
 	alive.lastProgress.Store(time.Now().UnixNano())
 	if p.isConnDestroyable(alive) {
 		t.Error("a connection with in-flight work making progress must never be destroyable")
+	}
+}
+
+// The pools keep their five-minute age limit by default, and SetMaxConnAge(0)
+// turns it off without making zero retire every connection.
+func TestPoolAgeLimitDefaultAndOff(t *testing.T) {
+	preset := fingerprint.Get("chrome-latest")
+	h2 := NewHostPool("example.com", "443", preset, nil)
+	h3 := NewQUICHostPool("example.com", "443", preset, nil)
+	if h2.maxConnAge != 5*time.Minute || h3.maxConnAge != 5*time.Minute {
+		t.Fatalf("default maxConnAge = %v (h2), %v (h3), want 5m", h2.maxConnAge, h3.maxConnAge)
+	}
+	h2.SetMaxConnAge(0)
+	if h2.maxConnAge != 0 {
+		t.Fatalf("SetMaxConnAge(0) left %v", h2.maxConnAge)
+	}
+	// Every age comparison must be guarded, or zero would retire everything.
+	for _, file := range []string{"pool.go", "quic_pool.go"} {
+		src, err := os.ReadFile(file)
+		if err != nil {
+			t.Fatal(err)
+		}
+		all := strings.Count(string(src), "time.Since(createdAt) > p.maxConnAge")
+		guarded := strings.Count(string(src), "p.maxConnAge > 0 && time.Since(createdAt) > p.maxConnAge")
+		if all == 0 || all != guarded {
+			t.Errorf("%s: %d of %d age comparisons check for no limit first", file, guarded, all)
+		}
 	}
 }

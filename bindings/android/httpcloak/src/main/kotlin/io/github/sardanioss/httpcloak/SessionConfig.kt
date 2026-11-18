@@ -74,6 +74,12 @@ public data class SessionConfig @JvmOverloads constructor(
     /** IP Don't Fragment bit. */
     public val tcpDf: Boolean? = null,
     /**
+     * Seconds after which an HTTP/2 connection takes no new requests and a
+     * fresh one is opened. Null keeps the default of five minutes; 0 turns
+     * the limit off.
+     */
+    public val http2MaxConnAge: Int? = null,
+    /**
      * cf.antibotapi.com API key. When set, a response that is a Cloudflare challenge is solved
      * through the service and the request sent again, inside the one call; cf_clearance stays in
      * the session's cookies. The preset must send a User-Agent the service has a device for.
@@ -139,6 +145,7 @@ public data class SessionConfig @JvmOverloads constructor(
         put("tcp_window_size", tcpWindowSize)
         put("tcp_window_scale", tcpWindowScale)
         put("tcp_df", tcpDf)
+        put("http2_max_conn_age", http2MaxConnAge)
         put("cloudflare_api_key", cloudflareApiKey)
         put("cloudflare_jwt_secret", cloudflareJwtSecret)
         put("cloudflare_service_url", cloudflareServiceUrl)

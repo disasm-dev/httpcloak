@@ -59,6 +59,24 @@ const Preset = {
   CHROME_155_MACOS: "chrome-155-macos",
   CHROME_155_IOS: "chrome-155-ios",
   CHROME_155_ANDROID: "chrome-155-android",
+  // Chrome 156 (headers only over 155)
+  CHROME_156: "chrome-156",
+  CHROME_156_WINDOWS: "chrome-156-windows",
+  CHROME_156_LINUX: "chrome-156-linux",
+  CHROME_156_MACOS: "chrome-156-macos",
+  CHROME_156_ANDROID: "chrome-156-android",
+  // Chrome 157 (headers only over 156)
+  CHROME_157: "chrome-157",
+  CHROME_157_WINDOWS: "chrome-157-windows",
+  CHROME_157_LINUX: "chrome-157-linux",
+  CHROME_157_MACOS: "chrome-157-macos",
+  CHROME_157_ANDROID: "chrome-157-android",
+  // Chrome 158 (headers only over 157)
+  CHROME_158: "chrome-158",
+  CHROME_158_WINDOWS: "chrome-158-windows",
+  CHROME_158_LINUX: "chrome-158-linux",
+  CHROME_158_MACOS: "chrome-158-macos",
+  CHROME_158_ANDROID: "chrome-158-android",
 
   // Chrome 152 (trust anchors, plus a greased signature algorithm on TCP)
   CHROME_152: "chrome-152",
@@ -160,6 +178,7 @@ const Preset = {
   SAFARI_18: "safari-18",
   SAFARI_17_IOS: "safari-17-ios",
   SAFARI_18_IOS: "safari-18-ios",
+  SAFARI_26_IOS: "safari-26-ios",
   SAFARI_LATEST_IOS: "safari-latest-ios",
 
   // Backwards compatibility aliases (old "ios-chrome" / "android-chrome" naming)
@@ -179,6 +198,7 @@ const Preset = {
   ANDROID_CHROME_LATEST: "chrome-latest-android",
   IOS_SAFARI_17: "safari-17-ios",
   IOS_SAFARI_18: "safari-18-ios",
+  IOS_SAFARI_26: "safari-26-ios",
   IOS_SAFARI_LATEST: "safari-latest-ios",
 
   /**
@@ -1415,8 +1435,25 @@ function applyAuth(headers, auth) {
   const credentials = Buffer.from(`${username}:${password}`).toString("base64");
 
   headers = headers ? { ...headers } : {};
+  // auth wins over an Authorization header in any spelling, and only one goes out.
+  for (const key of Object.keys(headers)) {
+    if (key.toLowerCase() === "authorization") delete headers[key];
+  }
   headers["Authorization"] = `Basic ${credentials}`;
   return headers;
+}
+
+/**
+ * Set name to value unless the caller already set it, in any spelling. The
+ * transport sends one spelling of a header name and prefers the canonical
+ * one, so a default added beside a caller's lowercase spelling would replace
+ * the caller's value.
+ */
+function defaultHeader(headers, name, value) {
+  const lname = name.toLowerCase();
+  if (!Object.keys(headers).some((k) => k.toLowerCase() === lname)) {
+    headers[name] = value;
+  }
 }
 
 /**
@@ -1631,6 +1668,7 @@ class Session {
    * @param {string} [options.echConfigDomain] - Domain to fetch ECH config from (e.g., "cloudflare-ech.com")
    * @param {boolean} [options.tlsOnly=false] - TLS-only mode: skip preset HTTP headers, only apply TLS fingerprint
    * @param {number} [options.quicIdleTimeout=0] - QUIC idle timeout in seconds (default: 30, 0 uses default)
+   * @param {number} [options.http2MaxConnAge] - Seconds after which an HTTP/2 connection takes no new requests (default: five minutes; 0 turns the limit off)
    */
   constructor(options = {}) {
     const {
@@ -1653,6 +1691,7 @@ class Session {
       echConfigDomain = null,
       tlsOnly = false,
       quicIdleTimeout = 0,
+      http2MaxConnAge = null,
       localAddress = null,
       keyLogFile = null,
       enableSpeculativeTls = false,
@@ -1730,6 +1769,14 @@ class Session {
     }
     if (quicIdleTimeout > 0) {
       config.quic_idle_timeout = quicIdleTimeout;
+    }
+    if (http2MaxConnAge !== null && http2MaxConnAge !== undefined) {
+      // The library takes whole seconds; a fraction went over as one it could
+      // not read, and that turned the limit off.
+      if (typeof http2MaxConnAge !== "number" || !Number.isFinite(http2MaxConnAge)) {
+        throw new TypeError("http2MaxConnAge must be a number of seconds");
+      }
+      config.http2_max_conn_age = Math.ceil(http2MaxConnAge);
     }
     if (localAddress) {
       config.local_address = localAddress;
@@ -1904,9 +1951,26 @@ class Session {
    */
   _mergeHeaders(headers) {
     if (!this.headers || Object.keys(this.headers).length === 0) {
-      return headers;
+      // A copy: json/data/files write their Content-Type into what this
+      // returns, and that used to land in the caller's own object.
+      return headers ? { ...headers } : headers;
     }
-    return { ...this.headers, ...headers };
+    // Header names are case-insensitive: a request's "authorization" replaces
+    // the session's "Authorization" instead of going out beside it as a second
+    // Authorization line.
+    const merged = { ...this.headers };
+    if (headers) {
+      const names = new Map(Object.keys(merged).map((k) => [k.toLowerCase(), k]));
+      for (const [key, value] of Object.entries(headers)) {
+        const previous = names.get(key.toLowerCase());
+        if (previous !== undefined && previous !== key) {
+          delete merged[previous];
+        }
+        merged[key] = value;
+        names.set(key.toLowerCase(), key);
+      }
+    }
+    return merged;
   }
 
   /**
@@ -1925,11 +1989,14 @@ class Session {
       .join("; ");
 
     headers = headers ? { ...headers } : {};
-    const existing = headers["Cookie"] || "";
+    // Merge with an existing Cookie header in whatever case it was given, so a
+    // caller's "cookie" and these don't become two Cookie headers.
+    const key = Object.keys(headers).find((k) => k.toLowerCase() === "cookie") || "Cookie";
+    const existing = headers[key] || "";
     if (existing) {
-      headers["Cookie"] = `${existing}; ${cookieStr}`;
+      headers[key] = `${existing}; ${cookieStr}`;
     } else {
-      headers["Cookie"] = cookieStr;
+      headers[key] = cookieStr;
     }
     return headers;
   }
@@ -2035,15 +2102,11 @@ class Session {
     } else if (json !== null) {
       bodyBuffer = Buffer.from(JSON.stringify(json), "utf8");
       mergedHeaders = mergedHeaders || {};
-      if (!mergedHeaders["Content-Type"]) {
-        mergedHeaders["Content-Type"] = "application/json";
-      }
+      defaultHeader(mergedHeaders, "Content-Type", "application/json");
     } else if (data !== null && typeof data === "object") {
       bodyBuffer = Buffer.from(new URLSearchParams(data).toString(), "utf8");
       mergedHeaders = mergedHeaders || {};
-      if (!mergedHeaders["Content-Type"]) {
-        mergedHeaders["Content-Type"] = "application/x-www-form-urlencoded";
-      }
+      defaultHeader(mergedHeaders, "Content-Type", "application/x-www-form-urlencoded");
     } else if (Buffer.isBuffer(body)) {
       bodyBuffer = body;
     } else if (typeof body === "string") {
@@ -2122,15 +2185,11 @@ class Session {
     } else if (json !== null) {
       bodyBuffer = Buffer.from(JSON.stringify(json), "utf8");
       mergedHeaders = mergedHeaders || {};
-      if (!mergedHeaders["Content-Type"]) {
-        mergedHeaders["Content-Type"] = "application/json";
-      }
+      defaultHeader(mergedHeaders, "Content-Type", "application/json");
     } else if (data !== null && typeof data === "object") {
       bodyBuffer = Buffer.from(new URLSearchParams(data).toString(), "utf8");
       mergedHeaders = mergedHeaders || {};
-      if (!mergedHeaders["Content-Type"]) {
-        mergedHeaders["Content-Type"] = "application/x-www-form-urlencoded";
-      }
+      defaultHeader(mergedHeaders, "Content-Type", "application/x-www-form-urlencoded");
     } else if (Buffer.isBuffer(body)) {
       bodyBuffer = body;
     } else if (typeof body === "string") {
@@ -2274,17 +2333,13 @@ class Session {
     else if (json !== null) {
       body = JSON.stringify(json);
       mergedHeaders = mergedHeaders || {};
-      if (!mergedHeaders["Content-Type"]) {
-        mergedHeaders["Content-Type"] = "application/json";
-      }
+      defaultHeader(mergedHeaders, "Content-Type", "application/json");
     }
     // Handle form data
     else if (data !== null && typeof data === "object") {
       body = new URLSearchParams(data).toString();
       mergedHeaders = mergedHeaders || {};
-      if (!mergedHeaders["Content-Type"]) {
-        mergedHeaders["Content-Type"] = "application/x-www-form-urlencoded";
-      }
+      defaultHeader(mergedHeaders, "Content-Type", "application/x-www-form-urlencoded");
     }
     // Handle Buffer body (binary payload). base64-encode so NUL bytes and
     // non-UTF-8 sequences survive the cgo C-string round-trip intact.
@@ -2375,17 +2430,13 @@ class Session {
     else if (json !== null) {
       body = JSON.stringify(json);
       mergedHeaders = mergedHeaders || {};
-      if (!mergedHeaders["Content-Type"]) {
-        mergedHeaders["Content-Type"] = "application/json";
-      }
+      defaultHeader(mergedHeaders, "Content-Type", "application/json");
     }
     // Handle form data
     else if (data !== null && typeof data === "object") {
       body = new URLSearchParams(data).toString();
       mergedHeaders = mergedHeaders || {};
-      if (!mergedHeaders["Content-Type"]) {
-        mergedHeaders["Content-Type"] = "application/x-www-form-urlencoded";
-      }
+      defaultHeader(mergedHeaders, "Content-Type", "application/x-www-form-urlencoded");
     }
     // Handle Buffer body (binary payload). base64-encode so non-UTF-8 bytes
     // and NUL bytes survive JSON.stringify + the C boundary.
@@ -3026,17 +3077,11 @@ class Session {
       url = addParamsToUrl(url, params);
     }
 
-    // Merge headers
-    let mergedHeaders = { ...this.headers };
-    if (headers) {
-      mergedHeaders = { ...mergedHeaders, ...headers };
-    }
-    if (cookies) {
-      const cookieStr = Object.entries(cookies).map(([k, v]) => `${k}=${v}`).join("; ");
-      mergedHeaders["Cookie"] = mergedHeaders["Cookie"]
-        ? `${mergedHeaders["Cookie"]}; ${cookieStr}`
-        : cookieStr;
-    }
+    // Merge headers in any spelling, as the buffered methods do: a spread
+    // kept the session's "Authorization" beside a request's "authorization",
+    // and the transport sends the canonical one.
+    let mergedHeaders = this._mergeHeaders(headers) || {};
+    mergedHeaders = this._applyCookies(mergedHeaders, cookies) || {};
 
     // Build options JSON
     const reqOptions = {};
@@ -3108,30 +3153,24 @@ class Session {
       url = addParamsToUrl(url, params);
     }
 
-    // Merge headers
-    let mergedHeaders = { ...this.headers };
-    if (headers) {
-      mergedHeaders = { ...mergedHeaders, ...headers };
-    }
+    // Merge headers in any spelling, as the buffered methods do: a spread
+    // kept the session's "Authorization" beside a request's "authorization",
+    // and the transport sends the canonical one.
+    let mergedHeaders = this._mergeHeaders(headers) || {};
 
     // Process body
     let body = null;
     if (jsonBody) {
       body = JSON.stringify(jsonBody);
-      mergedHeaders["Content-Type"] = mergedHeaders["Content-Type"] || "application/json";
+      defaultHeader(mergedHeaders, "Content-Type", "application/json");
     } else if (form) {
       body = Object.entries(form).map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`).join("&");
-      mergedHeaders["Content-Type"] = mergedHeaders["Content-Type"] || "application/x-www-form-urlencoded";
+      defaultHeader(mergedHeaders, "Content-Type", "application/x-www-form-urlencoded");
     } else if (bodyOpt) {
       body = typeof bodyOpt === "string" ? bodyOpt : bodyOpt.toString();
     }
 
-    if (cookies) {
-      const cookieStr = Object.entries(cookies).map(([k, v]) => `${k}=${v}`).join("; ");
-      mergedHeaders["Cookie"] = mergedHeaders["Cookie"]
-        ? `${mergedHeaders["Cookie"]}; ${cookieStr}`
-        : cookieStr;
-    }
+    mergedHeaders = this._applyCookies(mergedHeaders, cookies) || {};
 
     // Build options JSON
     const reqOptions = {};
@@ -3205,17 +3244,11 @@ class Session {
       url = addParamsToUrl(url, params);
     }
 
-    // Merge headers
-    let mergedHeaders = { ...this.headers };
-    if (headers) {
-      mergedHeaders = { ...mergedHeaders, ...headers };
-    }
-    if (cookies) {
-      const cookieStr = Object.entries(cookies).map(([k, v]) => `${k}=${v}`).join("; ");
-      mergedHeaders["Cookie"] = mergedHeaders["Cookie"]
-        ? `${mergedHeaders["Cookie"]}; ${cookieStr}`
-        : cookieStr;
-    }
+    // Merge headers in any spelling, as the buffered methods do: a spread
+    // kept the session's "Authorization" beside a request's "authorization",
+    // and the transport sends the canonical one.
+    let mergedHeaders = this._mergeHeaders(headers) || {};
+    mergedHeaders = this._applyCookies(mergedHeaders, cookies) || {};
 
     // Build request config
     const requestConfig = {
@@ -3824,6 +3857,7 @@ class LocalProxy {
    * @param {string} [options.tcpProxy] - Default upstream TCP proxy URL
    * @param {string} [options.udpProxy] - Default upstream UDP proxy URL
    * @param {boolean} [options.tlsOnly=false] - TLS-only mode: skip preset HTTP headers, only apply TLS fingerprint
+   * @param {boolean} [options.verify=true] - Verify the certificates of the sites the proxy connects to (false is for testing)
    */
   constructor(options = {}) {
     const {
@@ -3834,6 +3868,7 @@ class LocalProxy {
       tcpProxy = null,
       udpProxy = null,
       tlsOnly = false,
+      verify = true,
     } = options;
 
     this._lib = getLib();
@@ -3847,6 +3882,7 @@ class LocalProxy {
     if (tcpProxy) config.tcp_proxy = tcpProxy;
     if (udpProxy) config.udp_proxy = udpProxy;
     if (tlsOnly) config.tls_only = true;
+    if (verify === false) config.verify = false;
 
     const configJson = JSON.stringify(config);
     this._handle = this._lib.httpcloak_local_proxy_start(configJson);

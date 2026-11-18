@@ -8,7 +8,7 @@
 # shipped shape is missing, add a forwarding overload for it instead: see the
 # forwarders at the end of Session.cs, which carry the 1.6.8 and 1.7.0 shapes.
 #
-# 446 members.
+# 467 members.
 
 HttpCloak.Cookie.Domain : System.String
 HttpCloak.Cookie.Expires : System.String
@@ -56,6 +56,7 @@ HttpCloak.HttpCloakContentStream.Write(System.Byte[], System.Int32, System.Int32
 HttpCloak.HttpCloakException..ctor(System.String)
 HttpCloak.HttpCloakHandler..ctor(HttpCloak.LocalProxy)
 HttpCloak.HttpCloakHandler..ctor(System.String, System.String, System.String, System.String, System.Int32, System.Int32)
+HttpCloak.HttpCloakHandler..ctor(System.String, System.String, System.String, System.String, System.Int32, System.Int32, System.Boolean)
 HttpCloak.HttpCloakHandler.GetStats() : HttpCloak.LocalProxyStats
 HttpCloak.HttpCloakHandler.Proxy : HttpCloak.LocalProxy
 HttpCloak.HttpCloakHandler.ProxyUrl : System.String
@@ -71,6 +72,7 @@ HttpCloak.ISessionCache.OnError(System.String, System.String, System.String) : S
 HttpCloak.ISessionCache.Put(System.String, System.String, System.Int64) : System.Int32
 HttpCloak.ISessionCache.PutEch(System.String, System.String, System.Int64) : System.Int32
 HttpCloak.LocalProxy..ctor(System.Int32, System.String, System.Int32, System.Int32, System.String, System.String, System.Boolean)
+HttpCloak.LocalProxy..ctor(System.Int32, System.String, System.Int32, System.Int32, System.String, System.String, System.Boolean, System.Boolean)
 HttpCloak.LocalProxy.CreateClient(System.Net.Http.HttpClientHandler) : System.Net.Http.HttpClient
 HttpCloak.LocalProxy.CreateFingerprintHandler(System.Net.Http.HttpClientHandler) : System.Net.Http.HttpMessageHandler
 HttpCloak.LocalProxy.CreateHandler() : System.Net.Http.HttpClientHandler
@@ -189,6 +191,21 @@ HttpCloak.Presets.Chrome155IOS : System.String
 HttpCloak.Presets.Chrome155Linux : System.String
 HttpCloak.Presets.Chrome155MacOS : System.String
 HttpCloak.Presets.Chrome155Windows : System.String
+HttpCloak.Presets.Chrome156 : System.String
+HttpCloak.Presets.Chrome156Android : System.String
+HttpCloak.Presets.Chrome156Linux : System.String
+HttpCloak.Presets.Chrome156MacOS : System.String
+HttpCloak.Presets.Chrome156Windows : System.String
+HttpCloak.Presets.Chrome157 : System.String
+HttpCloak.Presets.Chrome157Android : System.String
+HttpCloak.Presets.Chrome157Linux : System.String
+HttpCloak.Presets.Chrome157MacOS : System.String
+HttpCloak.Presets.Chrome157Windows : System.String
+HttpCloak.Presets.Chrome158 : System.String
+HttpCloak.Presets.Chrome158Android : System.String
+HttpCloak.Presets.Chrome158Linux : System.String
+HttpCloak.Presets.Chrome158MacOS : System.String
+HttpCloak.Presets.Chrome158Windows : System.String
 HttpCloak.Presets.ChromeLatest : System.String
 HttpCloak.Presets.ChromeLatestAndroid : System.String
 HttpCloak.Presets.ChromeLatestIos : System.String
@@ -216,10 +233,12 @@ HttpCloak.Presets.IosChrome148 : System.String
 HttpCloak.Presets.IosChromeLatest : System.String
 HttpCloak.Presets.IosSafari17 : System.String
 HttpCloak.Presets.IosSafari18 : System.String
+HttpCloak.Presets.IosSafari26 : System.String
 HttpCloak.Presets.IosSafariLatest : System.String
 HttpCloak.Presets.Safari17Ios : System.String
 HttpCloak.Presets.Safari18 : System.String
 HttpCloak.Presets.Safari18Ios : System.String
+HttpCloak.Presets.Safari26Ios : System.String
 HttpCloak.Presets.SafariLatest : System.String
 HttpCloak.Presets.SafariLatestIos : System.String
 HttpCloak.RedirectInfo.GetHeader(System.String) : System.String
@@ -247,6 +266,8 @@ HttpCloak.Response.Text : System.String
 HttpCloak.Response.Trailer : System.Collections.Generic.IReadOnlyDictionary<System.String, System.String[]>
 HttpCloak.Response.Url : System.String
 HttpCloak.Session..ctor(System.String, System.String, System.String, System.String, System.Int32, System.String, System.Boolean, System.Boolean, System.Int32, System.Int32, System.Int32[], System.Int32, System.Int32, System.Boolean, System.Nullable<System.ValueTuple<System.String, System.String>>, System.Collections.Generic.Dictionary<System.String, System.String>, System.String, System.Boolean, System.Int32, System.String, System.String, System.Boolean, System.String, System.Boolean, System.Boolean, System.Boolean, System.Boolean, System.Boolean, System.Boolean, System.String, System.String, System.Collections.Generic.Dictionary<System.String, System.Object>, System.Nullable<System.Int32>, System.Nullable<System.Int32>, System.Nullable<System.Int32>, System.Nullable<System.Int32>, System.Nullable<System.Boolean>)
+HttpCloak.Session..ctor(System.String, System.String, System.String, System.String, System.Int32, System.String, System.Boolean, System.Boolean, System.Int32, System.Int32, System.Int32[], System.Int32, System.Int32, System.Boolean, System.Nullable<System.ValueTuple<System.String, System.String>>, System.Collections.Generic.Dictionary<System.String, System.String>, System.String, System.Boolean, System.Int32, System.String, System.String, System.Boolean, System.String, System.Boolean, System.Boolean, System.Boolean, System.Boolean, System.Boolean, System.Boolean, System.String, System.String, System.Collections.Generic.Dictionary<System.String, System.Object>, System.Nullable<System.Int32>, System.Nullable<System.Int32>, System.Nullable<System.Int32>, System.Nullable<System.Int32>, System.Nullable<System.Boolean>, System.Nullable<System.Int32>)
+HttpCloak.Session..ctor(System.String, System.String, System.String, System.String, System.Int32, System.String, System.Boolean, System.Boolean, System.Int32, System.Int32, System.Int32[], System.Int32, System.Int32, System.Boolean, System.Nullable<System.ValueTuple<System.String, System.String>>, System.Collections.Generic.Dictionary<System.String, System.String>, System.String, System.Boolean, System.Int32, System.String, System.String, System.Boolean, System.String, System.Boolean, System.Boolean, System.Boolean, System.Boolean, System.Boolean, System.Boolean, System.String, System.String, System.Collections.Generic.Dictionary<System.String, System.Object>, System.Nullable<System.Int32>, System.Nullable<System.Int32>, System.Nullable<System.Int32>, System.Nullable<System.Int32>, System.Nullable<System.Boolean>, System.Nullable<System.Int32>, System.String, System.String, System.String, System.String, System.String, System.String)
 HttpCloak.Session..ctor(System.String, System.String, System.String, System.String, System.Int32, System.String, System.Boolean, System.Boolean, System.Int32, System.Int32, System.Int32[], System.Int32, System.Int32, System.Boolean, System.Nullable<System.ValueTuple<System.String, System.String>>, System.Collections.Generic.Dictionary<System.String, System.String>, System.String, System.Boolean, System.Int32, System.String, System.String, System.Boolean, System.String, System.Boolean, System.Boolean, System.Boolean, System.Boolean, System.Boolean, System.Boolean, System.String, System.String, System.Collections.Generic.Dictionary<System.String, System.Object>, System.Nullable<System.Int32>, System.Nullable<System.Int32>, System.Nullable<System.Int32>, System.Nullable<System.Int32>, System.Nullable<System.Boolean>, System.String, System.String, System.String)
 HttpCloak.Session..ctor(System.String, System.String, System.String, System.String, System.Int32, System.String, System.Boolean, System.Boolean, System.Int32, System.Int32, System.Int32[], System.Int32, System.Int32, System.Boolean, System.Nullable<System.ValueTuple<System.String, System.String>>, System.Collections.Generic.Dictionary<System.String, System.String>, System.String, System.Boolean, System.Int32, System.String, System.String, System.Boolean, System.String, System.Boolean, System.Boolean, System.Boolean, System.Boolean, System.Boolean, System.Boolean, System.String, System.String, System.Collections.Generic.Dictionary<System.String, System.Object>, System.Nullable<System.Int32>, System.Nullable<System.Int32>, System.Nullable<System.Int32>, System.Nullable<System.Int32>, System.Nullable<System.Boolean>, System.String, System.String, System.String, System.String, System.String, System.String)
 HttpCloak.Session.Auth : System.Nullable<System.ValueTuple<System.String, System.String>>

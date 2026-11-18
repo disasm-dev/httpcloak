@@ -36,7 +36,7 @@ func udpCounter(t *testing.T, addr string) *atomic.Int32 {
 // The UDP port behind the test server shows exactly when a QUIC packet leaves.
 func TestAutoModeOpensQUICOnlyAfterAltSvc(t *testing.T) {
 	var advertise atomic.Pointer[string]
-	s := startH2Server(t, h2Config{ResponseHeaders: func() map[string]string {
+	s := startH2Server(t, h2Config{DynamicResponseHeaders: func() map[string]string {
 		if v := advertise.Load(); v != nil {
 			return map[string]string{"alt-svc": *v}
 		}

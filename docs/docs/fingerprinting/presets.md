@@ -23,37 +23,37 @@ Pick one by name, send a request, the wire bytes match the real browser.
 
 - **Default to `chrome-latest`.** Works against the widest range of targets, and auto-tracks the newest Chrome we've shipped.
 - **Reach for `android-chrome-latest` when you need a mobile UA.** Mobile traffic gets scored differently on most anti-bot stacks. The TLS handshake is identical to desktop Chrome, but the User-Agent and `sec-ch-ua-mobile: ?1` route the request onto the mobile path.
-- **Use `ios-safari-18` (or `safari-18-ios`) for an iPhone fingerprint.** Different cipher list, different pseudo-header order, no RFC 7540 priorities, smaller QUIC stream window. Targets that profile iOS users will spot a Chrome preset pretending to be an iPhone in seconds.
+- **Use `safari-latest-ios` (Safari 26) or `safari-18-ios` for an iPhone fingerprint.** Different cipher list, different pseudo-header order, no RFC 7540 priorities, smaller QUIC stream window. Targets that profile iOS users will spot a Chrome preset pretending to be an iPhone in seconds.
 - **Pick `firefox-148` when the target only accepts Firefox.** Different cipher list, different SETTINGS layout (smaller initial window, smaller max frame size), different pseudo-header order (`m,p,a,s` vs Chrome's `m,a,s,p`).
 
 ## Available preset families
 
 ### Chrome
 
-Versions 133, 141, and 143 through 155. The 143-155 line ships per-OS variants; 133 and 141 are desktop-only single presets without per-OS suffixes. Layout for the per-OS line (using 155 as the example):
+Versions 133, 141, and 143 through 158. The 143-158 line ships per-OS variants; 133 and 141 are desktop-only single presets without per-OS suffixes. Layout for the per-OS line (using 158 as the example):
 
 | Family | Variants |
 |---|---|
-| Desktop | `chrome-155`, `chrome-155-windows`, `chrome-155-linux`, `chrome-155-macos` (and the same shape for 154, 153, 152 ...) |
-| Android | `chrome-155-android` (every version except 149) |
+| Desktop | `chrome-158`, `chrome-158-windows`, `chrome-158-linux`, `chrome-158-macos` (and the same shape for 157, 156, 155 ...) |
+| Android | `chrome-158-android` (every version except 149) |
 | iOS     | `chrome-155-ios` is the newest; 143 to 152 plus 155 (no 149, 153 or 154) |
 
-Bare `chrome-155` resolves to the host OS at runtime via `runtime.GOOS`. On a Linux box, `chrome-155` gives you `chrome-155-linux`. For the same platform UA regardless of where the code runs, use the explicit variant.
+Bare `chrome-158` resolves to the host OS at runtime via `runtime.GOOS`. On a Linux box, `chrome-158` gives you `chrome-158-linux`. For the same platform UA regardless of where the code runs, use the explicit variant.
 
 ### Chrome -latest aliases
 
 Aliases that auto-track the newest shipped Chrome:
 
 ```
-chrome-latest          → chrome-155
-chrome-latest-windows  → chrome-155-windows
-chrome-latest-linux    → chrome-155-linux
-chrome-latest-macos    → chrome-155-macos
-chrome-latest-android  → chrome-155-android
+chrome-latest          → chrome-158
+chrome-latest-windows  → chrome-158-windows
+chrome-latest-linux    → chrome-158-linux
+chrome-latest-macos    → chrome-158-macos
+chrome-latest-android  → chrome-158-android
 chrome-latest-ios      → chrome-155-ios
 ```
 
-Every alias tracks 155, iOS included. iOS Chrome spells its version out in full, including a build number that cannot be guessed from the major version, so an iOS preset only ever gets built from a real capture; `chrome-155-ios` comes from one, and there is no `chrome-153-ios` or `chrome-154-ios`. Code on `chrome-latest` keeps rolling, and code that pinned `chrome-148-windows` stays on exactly the fingerprint it pinned.
+Desktop and Android track 158; iOS stays on 155. iOS Chrome spells its version out in full, including a build number that cannot be guessed from the major version, so an iOS preset only ever gets built from a real capture; `chrome-155-ios` comes from one, and there is no `chrome-153-ios`, `chrome-154-ios`, `chrome-156-ios`, `chrome-157-ios` or `chrome-158-ios`. Code on `chrome-latest` keeps rolling, and code that pinned `chrome-148-windows` stays on exactly the fingerprint it pinned.
 
 ### Firefox
 
@@ -67,7 +67,8 @@ The per-OS variants differ from their base in the User-Agent only. Firefox does 
 |---|---|
 | `safari-18` (`safari-latest`) | Desktop macOS Safari 18, supports h3 |
 | `safari-17-ios` (`ios-safari-17`) | iPhone Safari 17, h2 only |
-| `safari-18-ios` (`ios-safari-18`, `safari-latest-ios`) | iPhone Safari 18, supports h3 |
+| `safari-18-ios` (`ios-safari-18`) | iPhone Safari 18, supports h3 |
+| `safari-26-ios` (`ios-safari-26`, `safari-latest-ios`, `ios-safari-latest`) | iPhone Safari 26 from a real capture, h2. h3 is off by default until there's a QUIC capture; forcing it still sends Safari's QUIC shape |
 
 Safari sets `NoRFC7540Priorities=true`, so it never emits the H2 PRIORITY frame, and RFC 9218 priority headers carry the signal instead. That's the single biggest tell that splits a Safari fingerprint from a Chrome one at the H2 layer, even though both ALPN as h2.
 
@@ -78,9 +79,10 @@ The older `<os>-<browser>-<version>` naming still works for code written against
 ```
 ios-chrome-148        → chrome-148-ios
 ios-safari-18         → safari-18-ios
+ios-safari-26         → safari-26-ios
 android-chrome-148    → chrome-148-android
 ios-chrome-latest     → chrome-155-ios
-android-chrome-latest → chrome-155-android
+android-chrome-latest → chrome-158-android
 ```
 
 Both forms resolve to the same preset, and the `-latest` spellings move together: `android-chrome-latest` lands where `chrome-latest-android` does, and `ios-chrome-latest` where `chrome-latest-ios` does. The version-pinned old-style names only go from 143 to 148, though. For anything from 149 on, use the `chrome-NNN-android` / `chrome-NNN-ios` spelling. Prefer that form everywhere for new code.
@@ -186,11 +188,18 @@ foreach (var name in new[] { "chrome-latest", "android-chrome-latest", "firefox-
 </TabItem>
 </Tabs>
 
-Captured fingerprints (Linux host, HTTP/2; the 152 to 155 and `-latest` lines re-measured 2026-10-13, the rest 2026-08):
+Captured fingerprints (Linux host, HTTP/2; the 156 to 158 and `-latest` lines measured 2026-11-11, the 152 to 155 lines 2026-10-13, the rest 2026-08):
 
 ```text
 chrome-latest        ja4=t13d1517h2_8daaf6152771_cb7bf5808d99  peetprint_hash=fc97c1cdfb1409c9a9326c1b726d1dee  akamai_fingerprint_hash=52d84b11737d980aef856699f885ca86
 android-chrome-latest ja4=t13d1517h2_8daaf6152771_cb7bf5808d99  peetprint_hash=fc97c1cdfb1409c9a9326c1b726d1dee  akamai_fingerprint_hash=52d84b11737d980aef856699f885ca86
+chrome-158-windows   ja4=t13d1517h2_8daaf6152771_cb7bf5808d99  peetprint_hash=fc97c1cdfb1409c9a9326c1b726d1dee  akamai_fingerprint_hash=52d84b11737d980aef856699f885ca86
+chrome-158-android   ja4=t13d1517h2_8daaf6152771_cb7bf5808d99  peetprint_hash=fc97c1cdfb1409c9a9326c1b726d1dee  akamai_fingerprint_hash=52d84b11737d980aef856699f885ca86
+chrome-157-windows   ja4=t13d1517h2_8daaf6152771_cb7bf5808d99  peetprint_hash=fc97c1cdfb1409c9a9326c1b726d1dee  akamai_fingerprint_hash=52d84b11737d980aef856699f885ca86
+chrome-157-linux     ja4=t13d1517h2_8daaf6152771_cb7bf5808d99  peetprint_hash=fc97c1cdfb1409c9a9326c1b726d1dee  akamai_fingerprint_hash=52d84b11737d980aef856699f885ca86
+chrome-157-macos     ja4=t13d1517h2_8daaf6152771_cb7bf5808d99  peetprint_hash=fc97c1cdfb1409c9a9326c1b726d1dee  akamai_fingerprint_hash=52d84b11737d980aef856699f885ca86
+chrome-157-android   ja4=t13d1517h2_8daaf6152771_cb7bf5808d99  peetprint_hash=fc97c1cdfb1409c9a9326c1b726d1dee  akamai_fingerprint_hash=52d84b11737d980aef856699f885ca86
+chrome-156-windows   ja4=t13d1517h2_8daaf6152771_cb7bf5808d99  peetprint_hash=fc97c1cdfb1409c9a9326c1b726d1dee  akamai_fingerprint_hash=52d84b11737d980aef856699f885ca86
 chrome-155-windows   ja4=t13d1517h2_8daaf6152771_cb7bf5808d99  peetprint_hash=fc97c1cdfb1409c9a9326c1b726d1dee  akamai_fingerprint_hash=52d84b11737d980aef856699f885ca86
 chrome-155-linux     ja4=t13d1517h2_8daaf6152771_cb7bf5808d99  peetprint_hash=fc97c1cdfb1409c9a9326c1b726d1dee  akamai_fingerprint_hash=52d84b11737d980aef856699f885ca86
 chrome-155-macos     ja4=t13d1517h2_8daaf6152771_cb7bf5808d99  peetprint_hash=fc97c1cdfb1409c9a9326c1b726d1dee  akamai_fingerprint_hash=52d84b11737d980aef856699f885ca86
@@ -220,7 +229,7 @@ per handshake. The JA4 specification says to ignore greased values wherever they
 appear, and implementations differ on whether they do it in the signature list.
 One that strips them reports the stable `cb7bf5808d99` above; one that does not
 reports a different tail on every connection, sixteen in all. Real Chrome 152
-behaves exactly the same way (and the 153, 154 and 155 presets inherit it), so a tail that moves is the profile working, not
+behaves exactly the same way (and the 153 to 158 presets inherit it), so a tail that moves is the profile working, not
 failing. Compare on the parts before it, or on a tool you know strips greased
 values everywhere.
 
@@ -231,7 +240,7 @@ Things to spot:
 
 - Every Chrome desktop variant lands on the same JA4 / peetprint / akamai. The TLS handshake is identical across Windows / Linux / macOS Chrome. Only the User-Agent and `sec-ch-ua-platform` header tell you which OS you're on.
 - Android Chrome shares the same fingerprint as desktop Chrome. Same TLS, same H2. The wire-level difference is the UA string (Mobile Safari/537.36) and `sec-ch-ua-mobile: ?1`.
-- Chrome on iOS shows up as Safari at the wire level, since iOS WebKit forces every browser onto the system networking stack. `chrome-155-ios` (like 152) shares its TLS handshake and JA4 hash with `safari-18-ios`. They split only on H2 SETTINGS values (Chrome on iOS advertises `2,3,4,9` vs Safari's `2,4,3,5,9`) and the User-Agent.
+- Chrome on iOS shows up as Safari at the wire level, since iOS WebKit forces every browser onto the system networking stack. `chrome-155-ios` (like 152) shares its TLS handshake and JA4 hash with `safari-18-ios`. Against `safari-18-ios` they split on H2 SETTINGS (Chrome on iOS advertises `2,3,4,9`, Safari 18 `2,4,3,5,9`) and the User-Agent. Safari 26 moved to the same `2,3,4,9` layout, so `safari-26-ios` and `chrome-155-ios` differ mostly in headers and the User-Agent.
 - Firefox and Safari each get their own JA4 / peetprint / akamai. Different cipher list, different SETTINGS, different pseudo-header order.
 
 :::tip

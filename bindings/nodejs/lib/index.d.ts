@@ -260,6 +260,8 @@ export interface SessionOptions {
   tlsOnly?: boolean;
   /** QUIC idle timeout in seconds (default: 30). Set higher for long-lived HTTP/3 connections. */
   quicIdleTimeout?: number;
+  /** Seconds after which an HTTP/2 connection takes no new requests and a fresh one is opened (default: five minutes). 0 turns the limit off. Requests already on it still finish. */
+  http2MaxConnAge?: number;
   /** Local IP address to bind outgoing connections (for IPv6 rotation with IP_FREEBIND on Linux) */
   localAddress?: string;
   /** Path to write TLS key log for Wireshark decryption (overrides SSLKEYLOGFILE env var) */
@@ -384,9 +386,9 @@ export interface RequestOptions {
   disableHighEntropyClientHints?: boolean;
 
   /**
-   * Per-request opt-out of the Referer httpcloak adds when it follows a
-   * redirect. When true no Referer is synthesised for the next hop; a Referer
-   * the caller set themselves still goes out.
+   * Per-request opt-out of the Referer a redirect hop carries, which is the
+   * first request's own Referer re-applied for the hop's URL. When true no
+   * Referer goes out on any hop, including one the caller set.
    */
   disableRedirectReferer?: boolean;
 
@@ -976,6 +978,8 @@ export interface LocalProxyOptions {
   udpProxy?: string;
   /** TLS-only mode: skip preset HTTP headers, only apply TLS fingerprint (default: false) */
   tlsOnly?: boolean;
+  /** Verify the certificates of the sites the proxy connects to (default: true). false is for testing. */
+  verify?: boolean;
 }
 
 export interface LocalProxyStats {
@@ -1230,6 +1234,24 @@ export const Preset: {
   CHROME_155_MACOS: string;
   CHROME_155_IOS: string;
   CHROME_155_ANDROID: string;
+  // Chrome 156 (headers only over 155)
+  CHROME_156: string;
+  CHROME_156_WINDOWS: string;
+  CHROME_156_LINUX: string;
+  CHROME_156_MACOS: string;
+  CHROME_156_ANDROID: string;
+  // Chrome 157 (headers only over 156)
+  CHROME_157: string;
+  CHROME_157_WINDOWS: string;
+  CHROME_157_LINUX: string;
+  CHROME_157_MACOS: string;
+  CHROME_157_ANDROID: string;
+  // Chrome 158 (headers only over 157)
+  CHROME_158: string;
+  CHROME_158_WINDOWS: string;
+  CHROME_158_LINUX: string;
+  CHROME_158_MACOS: string;
+  CHROME_158_ANDROID: string;
 
   // Chrome 152 (trust anchors, plus a greased signature algorithm on TCP)
   CHROME_152: string;
@@ -1331,6 +1353,7 @@ export const Preset: {
   SAFARI_18: string;
   SAFARI_17_IOS: string;
   SAFARI_18_IOS: string;
+  SAFARI_26_IOS: string;
   SAFARI_LATEST_IOS: string;
 
   // Backwards compatibility aliases (old "ios-chrome" / "android-chrome" naming)
@@ -1350,6 +1373,7 @@ export const Preset: {
   ANDROID_CHROME_LATEST: string;
   IOS_SAFARI_17: string;
   IOS_SAFARI_18: string;
+  IOS_SAFARI_26: string;
   IOS_SAFARI_LATEST: string;
 
   all(): string[];

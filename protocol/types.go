@@ -224,6 +224,11 @@ type SessionConfig struct {
 	// Connections are closed after this duration of inactivity
 	QuicIdleTimeout int `json:"quicIdleTimeout,omitempty"`
 
+	// HTTP2MaxConnAge stops new requests going out on an HTTP/2 connection
+	// older than this many seconds. Zero keeps the default of five minutes;
+	// a negative value turns the limit off.
+	HTTP2MaxConnAge int `json:"http2MaxConnAge,omitempty"`
+
 	// KeyLogFile is the path to write TLS key log for Wireshark decryption.
 	// If set, overrides the global SSLKEYLOGFILE environment variable for this session.
 	KeyLogFile string `json:"keyLogFile,omitempty"`

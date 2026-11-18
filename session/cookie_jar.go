@@ -24,7 +24,7 @@ type CookieData struct {
 	HostOnly  bool   // True if cookie should only be sent to exact host
 	Path      string
 	Expires   *time.Time
-	MaxAge    int
+	MaxAge    int // 0: absent; <0: delete now; >0: lifetime in seconds
 	Secure    bool
 	HttpOnly  bool
 	SameSite  string
@@ -97,24 +97,67 @@ func (j *CookieJar) Set(requestHost string, cookie *CookieData, requestSecure bo
 
 	// Create the stored cookie
 	stored := &CookieData{
-		Name:      cookie.Name,
-		Value:     cookie.Value,
-		Domain:    domain,
-		HostOnly:  hostOnly,
-		Path:      path,
-		Expires:   cookie.Expires,
-		MaxAge:    cookie.MaxAge,
-		Secure:    cookie.Secure,
-		HttpOnly:  cookie.HttpOnly,
-		SameSite:  cookie.SameSite,
-		CreatedAt: time.Now(),
+		Name:     cookie.Name,
+		Value:    cookie.Value,
+		Domain:   domain,
+		HostOnly: hostOnly,
+		Path:     path,
+		Expires:  cookie.Expires,
+		MaxAge:   cookie.MaxAge,
+		Secure:   cookie.Secure,
+		HttpOnly: cookie.HttpOnly,
+		SameSite: cookie.SameSite,
+	}
+	j.receive(stored, time.Now())
+}
+
+// receive stores a cookie that just arrived on a Set-Cookie header, where
+// Max-Age wins over Expires (RFC 6265 5.3 step 3). The caller must hold j.mu.
+func (j *CookieJar) receive(cookie *CookieData, now time.Time) {
+	resolveMaxAge(cookie, now)
+	j.store(cookie, now)
+}
+
+// resolveMaxAge turns a positive Max-Age into an absolute deadline. Do it
+// once, on receipt: a copy carries that deadline and must not restart it.
+func resolveMaxAge(cookie *CookieData, now time.Time) {
+	cookie.MaxAge = capMaxAge(cookie.MaxAge)
+	if cookie.MaxAge > 0 {
+		expires := now.Add(time.Duration(cookie.MaxAge) * time.Second)
+		cookie.Expires = &expires
+	}
+}
+
+// capMaxAge applies Chromium's 400-day cap to a Max-Age from any source:
+// parseMaxAge caps a Set-Cookie header's, but SetCookie and saved state from
+// older releases hand the jar theirs directly. The cap also keeps the value
+// inside 32 bits, which the bindings read it as.
+func capMaxAge(maxAge int) int {
+	return min(maxAge, maxCookieAgeSeconds)
+}
+
+// store inserts an already scoped cookie. The caller must hold j.mu.
+func (j *CookieJar) store(cookie *CookieData, now time.Time) {
+	domain := cookie.Domain
+	key := cookieKey(cookie.Path, cookie.Name)
+	if cookie.MaxAge < 0 || (cookie.Expires != nil && !cookie.Expires.After(now)) {
+		delete(j.cookies[domain], key)
+		if len(j.cookies[domain]) == 0 {
+			delete(j.cookies, domain)
+		}
+		return
 	}
 
-	// Store the cookie
+	cookie.CreatedAt = now
+	if previous := j.cookies[domain][key]; previous != nil &&
+		(previous.Expires == nil || previous.Expires.After(now)) {
+		// Replacing a live cookie keeps its header ordering, not its old TTL.
+		cookie.CreatedAt = previous.CreatedAt
+	}
 	if j.cookies[domain] == nil {
 		j.cookies[domain] = make(map[string]*CookieData)
 	}
-	j.cookies[domain][cookieKey(path, cookie.Name)] = stored
+	j.cookies[domain][key] = cookie
 }
 
 // Get returns all cookies that should be sent for a request
@@ -164,7 +207,7 @@ func (j *CookieJar) Get(requestHost, requestPath string, requestSecure bool) []*
 			}
 
 			// Expiration check
-			if cookie.Expires != nil && cookie.Expires.Before(now) {
+			if cookie.Expires != nil && !cookie.Expires.After(now) {
 				continue
 			}
 
@@ -194,7 +237,7 @@ func (j *CookieJar) GetAll() []CookieState {
 	for _, domainCookies := range j.cookies {
 		for _, c := range domainCookies {
 			// Skip expired cookies
-			if c.Expires != nil && c.Expires.Before(now) {
+			if c.Expires != nil && !c.Expires.After(now) {
 				continue
 			}
 
@@ -205,7 +248,7 @@ func (j *CookieJar) GetAll() []CookieState {
 				Domain:    c.Domain,
 				Path:      c.Path,
 				Expires:   c.Expires,
-				MaxAge:    c.MaxAge,
+				MaxAge:    capMaxAge(c.MaxAge),
 				Secure:    c.Secure,
 				HttpOnly:  c.HttpOnly,
 				SameSite:  c.SameSite,
@@ -251,22 +294,26 @@ func (j *CookieJar) SetSimple(name, value, domain, path string, secure, httpOnly
 		path = "/"
 	}
 
-	if j.cookies[domain] == nil {
-		j.cookies[domain] = make(map[string]*CookieData)
+	cookie := &CookieData{
+		Name:     name,
+		Value:    value,
+		Domain:   domain,
+		HostOnly: hostOnly,
+		Path:     path,
+		Expires:  expires,
+		MaxAge:   capMaxAge(maxAge),
+		Secure:   secure,
+		HttpOnly: httpOnly,
+		SameSite: sameSite,
 	}
-	j.cookies[domain][cookieKey(path, name)] = &CookieData{
-		Name:      name,
-		Value:     value,
-		Domain:    domain,
-		HostOnly:  hostOnly,
-		Path:      path,
-		Expires:   expires,
-		MaxAge:    maxAge,
-		Secure:    secure,
-		HttpOnly:  httpOnly,
-		SameSite:  sameSite,
-		CreatedAt: time.Now(),
+	now := time.Now()
+	// A cookie read back from GetCookies carries both fields, with Expires
+	// already resolved from Max-Age. Resolving again would restart its clock
+	// on every copy, so Max-Age only counts when no Expires came with it.
+	if expires == nil {
+		resolveMaxAge(cookie, now)
 	}
+	j.store(cookie, now)
 }
 
 // Delete removes cookies by name. If domain is empty, removes ALL cookies with
@@ -320,7 +367,7 @@ func (j *CookieJar) ClearExpired() {
 	now := time.Now()
 	for domain, domainCookies := range j.cookies {
 		for key, cookie := range domainCookies {
-			if cookie.Expires != nil && cookie.Expires.Before(now) {
+			if cookie.Expires != nil && !cookie.Expires.After(now) {
 				delete(domainCookies, key)
 			}
 		}
@@ -354,7 +401,7 @@ func (j *CookieJar) Export() map[string][]CookieState {
 		var cookies []CookieState
 		for _, c := range domainCookies {
 			// Skip expired cookies
-			if c.Expires != nil && c.Expires.Before(now) {
+			if c.Expires != nil && !c.Expires.After(now) {
 				continue
 			}
 
@@ -365,7 +412,7 @@ func (j *CookieJar) Export() map[string][]CookieState {
 				Domain:    c.Domain,
 				Path:      c.Path,
 				Expires:   c.Expires,
-				MaxAge:    c.MaxAge,
+				MaxAge:    capMaxAge(c.MaxAge),
 				Secure:    c.Secure,
 				HttpOnly:  c.HttpOnly,
 				SameSite:  c.SameSite,
@@ -394,7 +441,7 @@ func (j *CookieJar) Import(cookies map[string][]CookieState) {
 
 		for _, c := range domainCookies {
 			// Skip expired cookies
-			if c.Expires != nil && c.Expires.Before(now) {
+			if c.MaxAge < 0 || (c.Expires != nil && !c.Expires.After(now)) {
 				continue
 			}
 
@@ -419,7 +466,7 @@ func (j *CookieJar) Import(cookies map[string][]CookieState) {
 				HostOnly:  hostOnly,
 				Path:      path,
 				Expires:   c.Expires,
-				MaxAge:    c.MaxAge,
+				MaxAge:    capMaxAge(c.MaxAge),
 				Secure:    c.Secure,
 				HttpOnly:  c.HttpOnly,
 				SameSite:  c.SameSite,
@@ -438,7 +485,7 @@ func (j *CookieJar) ImportV4(cookies []CookieState) {
 
 	for _, c := range cookies {
 		// Skip expired cookies
-		if c.Expires != nil && c.Expires.Before(now) {
+		if c.MaxAge < 0 || (c.Expires != nil && !c.Expires.After(now)) {
 			continue
 		}
 
@@ -474,7 +521,7 @@ func (j *CookieJar) ImportV4(cookies []CookieState) {
 			HostOnly:  hostOnly,
 			Path:      path,
 			Expires:   c.Expires,
-			MaxAge:    c.MaxAge,
+			MaxAge:    capMaxAge(c.MaxAge),
 			Secure:    c.Secure,
 			HttpOnly:  c.HttpOnly,
 			SameSite:  c.SameSite,

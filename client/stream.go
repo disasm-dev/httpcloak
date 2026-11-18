@@ -6,6 +6,8 @@ import (
 	"context"
 	"fmt"
 	http "github.com/sardanioss/http"
+	"github.com/sardanioss/httpcloak/internal/altsvc"
+	"github.com/sardanioss/httpcloak/internal/respheader"
 	"io"
 	"net/url"
 	"strings"
@@ -257,7 +259,7 @@ func (c *Client) DoStream(ctx context.Context, req *Request) (*StreamResponse, e
 	}
 
 	// Alt-Svc, as in Do: it decides whether later requests may use HTTP/3.
-	c.altSvc.Learn(host, port, resp.Header.Values("Alt-Svc"), time.Now())
+	c.altSvc.Learn(host, port, altsvc.HeaderValues(resp.Header), time.Now())
 
 	// Build response headers map (multi-value support)
 	headers := make(map[string][]string)
@@ -271,13 +273,13 @@ func (c *Client) DoStream(ctx context.Context, req *Request) (*StreamResponse, e
 	// Store cookies from response (parity with Do, see client.go:943-947).
 	// Set-Cookie is a response *header*, not body, so it's available before
 	// the streaming body is consumed and we don't need to defer this.
-	setCookies := resp.Header["Set-Cookie"]
+	setCookies := respheader.SetCookie(resp.Header)
 	if c.cookies != nil && len(setCookies) > 0 {
 		c.cookies.SetCookiesFromHeaderList(parsedURL, setCookies)
 	}
 
 	// Setup decompression reader
-	reader, decompressor := setupDecompressor(resp.Body, resp.Header.Get("Content-Encoding"))
+	reader, decompressor := setupDecompressor(resp.Body, respheader.ContentEncoding(resp.Header))
 
 	timing.FirstByte = float64(time.Since(startTime).Milliseconds())
 

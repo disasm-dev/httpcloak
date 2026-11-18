@@ -20,6 +20,7 @@ Example:
 import asyncio
 import base64
 import json
+import math
 import warnings
 
 # The request methods take a parameter called json, which shadows the module
@@ -194,6 +195,27 @@ class Preset:
     CHROME_155_IOS = "chrome-155-ios"
     CHROME_155_ANDROID = "chrome-155-android"
 
+    # Chrome 156 (headers only over 155)
+    CHROME_156 = "chrome-156"
+    CHROME_156_WINDOWS = "chrome-156-windows"
+    CHROME_156_LINUX = "chrome-156-linux"
+    CHROME_156_MACOS = "chrome-156-macos"
+    CHROME_156_ANDROID = "chrome-156-android"
+
+    # Chrome 157 (headers only over 156)
+    CHROME_157 = "chrome-157"
+    CHROME_157_WINDOWS = "chrome-157-windows"
+    CHROME_157_LINUX = "chrome-157-linux"
+    CHROME_157_MACOS = "chrome-157-macos"
+    CHROME_157_ANDROID = "chrome-157-android"
+
+    # Chrome 158 (headers only over 157)
+    CHROME_158 = "chrome-158"
+    CHROME_158_WINDOWS = "chrome-158-windows"
+    CHROME_158_LINUX = "chrome-158-linux"
+    CHROME_158_MACOS = "chrome-158-macos"
+    CHROME_158_ANDROID = "chrome-158-android"
+
     # Chrome 152 (trust anchors, plus a greased signature algorithm on TCP)
     CHROME_152 = "chrome-152"
     CHROME_152_WINDOWS = "chrome-152-windows"
@@ -294,6 +316,7 @@ class Preset:
     SAFARI_18 = "safari-18"
     SAFARI_17_IOS = "safari-17-ios"
     SAFARI_18_IOS = "safari-18-ios"
+    SAFARI_26_IOS = "safari-26-ios"
     SAFARI_LATEST_IOS = "safari-latest-ios"
 
     # Backwards compatibility aliases (old naming convention used "ios-chrome" / "android-chrome" prefix)
@@ -313,6 +336,7 @@ class Preset:
     ANDROID_CHROME_LATEST = CHROME_LATEST_ANDROID
     IOS_SAFARI_17 = SAFARI_17_IOS
     IOS_SAFARI_18 = SAFARI_18_IOS
+    IOS_SAFARI_26 = SAFARI_26_IOS
     IOS_SAFARI_LATEST = SAFARI_LATEST_IOS
 
     @classmethod
@@ -367,7 +391,7 @@ class Cookie:
         domain: Cookie domain
         path: Cookie path
         expires: Expiration date (RFC1123 format)
-        max_age: Max age in seconds (0 means not set)
+        max_age: Max age in seconds (0 means not set, -1 means the server asked to delete it)
         secure: Secure flag
         http_only: HttpOnly flag
         same_site: SameSite attribute (Strict, Lax, None)
@@ -1680,8 +1704,24 @@ def _apply_auth(
     credentials = base64.b64encode(f"{username}:{password}".encode()).decode()
 
     headers = headers.copy() if headers else {}
+    # auth= wins over an Authorization header in any spelling, as in requests,
+    # and only one goes out.
+    for key in [k for k in headers if k.lower() == "authorization"]:
+        del headers[key]
     headers["Authorization"] = f"Basic {credentials}"
     return headers
+
+
+def _default_header(headers: Dict[str, str], name: str, value: str) -> None:
+    """Set name to value unless the caller already set it, in any spelling.
+
+    The transport sends one spelling of a header name and prefers the
+    canonical one, so a default added beside a caller's lowercase spelling
+    would replace the caller's value.
+    """
+    lname = name.lower()
+    if not any(k.lower() == lname for k in headers):
+        headers[name] = value
 
 
 def version() -> str:
@@ -1806,6 +1846,9 @@ class Session:
             Saves ~15-20ms on first connect at the cost of the privacy bump ECH provides.
         tls_only: TLS-only mode - skip preset HTTP headers, only apply TLS fingerprint (default: False)
         quic_idle_timeout: QUIC connection idle timeout in seconds (default: 30). Set higher for long-lived H3 connections.
+        http2_max_conn_age: Seconds after which an HTTP/2 connection takes no new requests and a fresh
+            one is opened (default: None, five minutes). 0 turns the limit off, so a connection is
+            reused for as long as the server keeps it open. Requests already on it still finish.
         local_address: Local IP address to bind outgoing connections to (e.g., "192.168.1.100" or "::1")
         key_log_file: Path to write TLS key log (NSS format) for Wireshark decryption
         enable_speculative_tls: Enable speculative TLS optimization for proxy connections (default: False).
@@ -1891,6 +1934,7 @@ class Session:
         tcp_window_size: Optional[int] = None,
         tcp_window_scale: Optional[int] = None,
         tcp_df: Optional[bool] = None,
+        http2_max_conn_age: Optional[float] = None,
         cloudflare_api_key: Optional[str] = None,
         cloudflare_jwt_secret: Optional[str] = None,
         cloudflare_service_url: Optional[str] = None,
@@ -1934,6 +1978,14 @@ class Session:
             config["tls_only"] = True
         if quic_idle_timeout > 0:
             config["quic_idle_timeout"] = quic_idle_timeout
+        if http2_max_conn_age is not None:
+            # The library takes whole seconds. A float went over as 90.0,
+            # which it could not read, and that turned the limit off.
+            if isinstance(http2_max_conn_age, bool) or not isinstance(http2_max_conn_age, (int, float)):
+                raise TypeError("http2_max_conn_age must be a number of seconds")
+            if not math.isfinite(http2_max_conn_age):
+                raise ValueError("http2_max_conn_age must be finite; 0 turns the limit off")
+            config["http2_max_conn_age"] = int(math.ceil(http2_max_conn_age))
         if local_address:
             config["local_address"] = local_address
         if key_log_file:
@@ -2089,7 +2141,19 @@ class Session:
             return None
         merged = dict(self.headers)
         if headers:
-            merged.update(headers)
+            # Header names are case-insensitive: a request's "authorization"
+            # replaces the session's "Authorization" instead of going out
+            # beside it as a second Authorization line. A list or tuple of
+            # (name, value) pairs is accepted too, as dict.update and
+            # requests accept it.
+            names = {k.lower(): k for k in merged}
+            items = headers.items() if hasattr(headers, "items") else headers
+            for key, value in items:
+                previous = names.get(key.lower())
+                if previous is not None and previous != key:
+                    del merged[previous]
+                merged[key] = value
+                names[key.lower()] = key
         return merged if merged else None
 
     def _apply_cookies(
@@ -2103,12 +2167,14 @@ class Session:
         cookie_str = "; ".join(f"{k}={v}" for k, v in cookies.items())
 
         headers = headers.copy() if headers else {}
-        # Merge with existing Cookie header if present
-        existing = headers.get("Cookie", "")
+        # Merge with an existing Cookie header in whatever case it was given,
+        # so a caller's "cookie" and these don't become two Cookie headers.
+        key = next((k for k in headers if k.lower() == "cookie"), "Cookie")
+        existing = headers.get(key, "")
         if existing:
-            headers["Cookie"] = f"{existing}; {cookie_str}"
+            headers[key] = f"{existing}; {cookie_str}"
         else:
-            headers["Cookie"] = cookie_str
+            headers[key] = cookie_str
         return headers
 
     def _streaming_upload(
@@ -2253,7 +2319,10 @@ class Session:
             effective_auth = auth if auth is not None else self.auth
             merged_headers = _apply_auth(merged_headers, effective_auth)
             merged_headers = self._apply_cookies(merged_headers, cookies)
-            content_type = (merged_headers or {}).get("Content-Type", "application/octet-stream")
+            content_type = next(
+                (v for k, v in (merged_headers or {}).items() if k.lower() == "content-type"),
+                "application/octet-stream",
+            )
             return self._streaming_upload(
                 "POST",
                 url,
@@ -2274,12 +2343,12 @@ class Session:
         elif json is not None:
             body = json_module.dumps(json).encode("utf-8")
             merged_headers = merged_headers or {}
-            merged_headers.setdefault("Content-Type", "application/json")
+            _default_header(merged_headers, "Content-Type", "application/json")
         elif data is not None:
             if isinstance(data, dict):
                 body = urlencode(data).encode("utf-8")
                 merged_headers = merged_headers or {}
-                merged_headers.setdefault("Content-Type", "application/x-www-form-urlencoded")
+                _default_header(merged_headers, "Content-Type", "application/x-www-form-urlencoded")
             elif isinstance(data, str):
                 body = data.encode("utf-8")
             else:
@@ -2387,12 +2456,12 @@ class Session:
         elif json is not None:
             body_bytes = json_module.dumps(json).encode("utf-8")
             merged_headers = merged_headers or {}
-            merged_headers.setdefault("Content-Type", "application/json")
+            _default_header(merged_headers, "Content-Type", "application/json")
         elif data is not None:
             if isinstance(data, dict):
                 body_bytes = urlencode(data).encode("utf-8")
                 merged_headers = merged_headers or {}
-                merged_headers.setdefault("Content-Type", "application/x-www-form-urlencoded")
+                _default_header(merged_headers, "Content-Type", "application/x-www-form-urlencoded")
             elif isinstance(data, str):
                 body_bytes = data.encode("utf-8")
             elif isinstance(data, bytes):
@@ -2666,12 +2735,12 @@ class Session:
         elif json_data is not None:
             body = _json.dumps(json_data).encode("utf-8")
             merged_headers = merged_headers or {}
-            merged_headers.setdefault("Content-Type", "application/json")
+            _default_header(merged_headers, "Content-Type", "application/json")
         elif data is not None:
             if isinstance(data, dict):
                 body = urlencode(data).encode("utf-8")
                 merged_headers = merged_headers or {}
-                merged_headers.setdefault("Content-Type", "application/x-www-form-urlencoded")
+                _default_header(merged_headers, "Content-Type", "application/x-www-form-urlencoded")
             elif isinstance(data, str):
                 body = data.encode("utf-8")
             else:
@@ -2787,12 +2856,12 @@ class Session:
         elif json_data is not None:
             body = _json.dumps(json_data)
             merged_headers = merged_headers or {}
-            merged_headers.setdefault("Content-Type", "application/json")
+            _default_header(merged_headers, "Content-Type", "application/json")
         elif data is not None:
             if isinstance(data, dict):
                 body = urlencode(data)
                 merged_headers = merged_headers or {}
-                merged_headers.setdefault("Content-Type", "application/x-www-form-urlencoded")
+                _default_header(merged_headers, "Content-Type", "application/x-www-form-urlencoded")
             elif isinstance(data, bytes):
                 body = base64.b64encode(data).decode("ascii")
                 body_encoding = "base64"
@@ -2961,7 +3030,7 @@ class Session:
             secure: Secure flag
             http_only: HttpOnly flag
             same_site: SameSite attribute (Strict, Lax, None)
-            max_age: Max age in seconds (0 means not set)
+            max_age: Max age in seconds (0 means not set, -1 means the server asked to delete it)
             expires: Expiration date in RFC1123 format (e.g. "Mon, 02 Jan 2006 15:04:05 GMT")
         """
         cookie = {
@@ -3635,14 +3704,15 @@ class Session:
             # body with no headers could not be sent at all. The sync methods
             # already guard the same way.
             merged_headers = merged_headers or {}
-            merged_headers["content-type"] = "application/json"
+            _default_header(merged_headers, "Content-Type", "application/json")
         elif data is not None:
             if isinstance(data, dict):
                 # Form data
                 from urllib.parse import urlencode
                 body_bytes = urlencode(data).encode("utf-8")
                 body_len = len(body_bytes)
-                merged_headers["content-type"] = "application/x-www-form-urlencoded"
+                merged_headers = merged_headers or {}
+                _default_header(merged_headers, "Content-Type", "application/x-www-form-urlencoded")
             elif isinstance(data, str):
                 body_bytes = data.encode("utf-8")
                 body_len = len(body_bytes)
@@ -3740,12 +3810,13 @@ class Session:
             # body with no headers could not be sent at all. The sync methods
             # already guard the same way.
             merged_headers = merged_headers or {}
-            merged_headers["content-type"] = "application/json"
+            _default_header(merged_headers, "Content-Type", "application/json")
         elif data is not None:
             if isinstance(data, dict):
                 body_bytes = urlencode(data).encode("utf-8")
                 body_len = len(body_bytes)
-                merged_headers["content-type"] = "application/x-www-form-urlencoded"
+                merged_headers = merged_headers or {}
+                _default_header(merged_headers, "Content-Type", "application/x-www-form-urlencoded")
             elif isinstance(data, str):
                 body_bytes = data.encode("utf-8")
                 body_len = len(body_bytes)
@@ -4012,12 +4083,12 @@ class Session:
         if json_data is not None:
             body = _json.dumps(json_data).encode("utf-8")
             merged_headers = merged_headers or {}
-            merged_headers.setdefault("Content-Type", "application/json")
+            _default_header(merged_headers, "Content-Type", "application/json")
         elif data is not None:
             if isinstance(data, dict):
                 body = urlencode(data).encode("utf-8")
                 merged_headers = merged_headers or {}
-                merged_headers.setdefault("Content-Type", "application/x-www-form-urlencoded")
+                _default_header(merged_headers, "Content-Type", "application/x-www-form-urlencoded")
             elif isinstance(data, str):
                 body = data.encode("utf-8")
             else:
@@ -4397,12 +4468,12 @@ class Session:
         if json_data is not None:
             body = _json.dumps(json_data)
             merged_headers = merged_headers or {}
-            merged_headers.setdefault("Content-Type", "application/json")
+            _default_header(merged_headers, "Content-Type", "application/json")
         elif data is not None:
             if isinstance(data, dict):
                 body = urlencode(data)
                 merged_headers = merged_headers or {}
-                merged_headers.setdefault("Content-Type", "application/x-www-form-urlencoded")
+                _default_header(merged_headers, "Content-Type", "application/x-www-form-urlencoded")
             elif isinstance(data, bytes):
                 body = data.decode("utf-8")
             else:
@@ -4495,12 +4566,12 @@ class Session:
         if json_data is not None:
             body = _json.dumps(json_data)
             merged_headers = merged_headers or {}
-            merged_headers.setdefault("Content-Type", "application/json")
+            _default_header(merged_headers, "Content-Type", "application/json")
         elif data is not None:
             if isinstance(data, dict):
                 body = urlencode(data)
                 merged_headers = merged_headers or {}
-                merged_headers.setdefault("Content-Type", "application/x-www-form-urlencoded")
+                _default_header(merged_headers, "Content-Type", "application/x-www-form-urlencoded")
             elif isinstance(data, bytes):
                 body = data.decode("utf-8")
             else:
@@ -4863,6 +4934,7 @@ class LocalProxy:
         tcp_proxy: Optional[str] = None,
         udp_proxy: Optional[str] = None,
         tls_only: bool = False,
+        verify: bool = True,
     ):
         """
         Create and start a local HTTP proxy server.
@@ -4876,6 +4948,8 @@ class LocalProxy:
             udp_proxy: Default upstream UDP proxy URL (can be overridden per-request)
             tls_only: TLS-only mode - skip preset HTTP headers, only apply TLS fingerprint.
                       Use this when your client already provides authentic browser headers.
+            verify: Verify the certificates of the sites the proxy connects to (default: True).
+                    False is for testing against a self-signed certificate.
         """
         self._lib = _get_lib()
         self._handle: int = -1
@@ -4892,6 +4966,8 @@ class LocalProxy:
             config["udp_proxy"] = udp_proxy
         if tls_only:
             config["tls_only"] = True
+        if not verify:
+            config["verify"] = False
 
         config_json = json.dumps(config).encode("utf-8")
         self._handle = self._lib.httpcloak_local_proxy_start(config_json)

@@ -109,6 +109,12 @@ type Preset struct {
 	RawPSKClientHello []byte
 	RawBluntMimicry   bool
 
+	// RawQUICClientHello is a ClientHello captured from a QUIC handshake, kept
+	// apart from RawClientHello so one preset can replay a client on both
+	// transports. RawQUICPSKClientHello is its resumption counterpart.
+	RawQUICClientHello    []byte
+	RawQUICPSKClientHello []byte
+
 	// RawPermuteExtensions shuffles a captured hello's extension order per
 	// connection, the way Chromium does.
 	//
@@ -744,7 +750,9 @@ type H3FingerprintConfig struct {
 	//
 	// The parameter is sent only for Chromium QUIC identities; a Firefox or
 	// WebKit preset carries no google_connection_options at all whatever this
-	// says, which is why describe emits the key only when it is set.
+	// says, which is why describe emits the key only when it is set. A preset
+	// whose HTTP/3 hello is a capture sends it only if the capture carries it,
+	// and nil there means the captured tags rather than ["ORIG"].
 	//
 	// The value is not fixed by Chrome version. Chromium builds it from
 	// features::kQuicOptions, a Finch parameter parsed under kTryQuicByDefault
@@ -3369,6 +3377,151 @@ func AndroidChrome155() *Preset {
 	return AndroidChrome154()
 }
 
+// Chrome156Windows returns Chrome 156 on Windows. Headers-only over 155: the
+// User-Agent and sec-ch-ua move, nothing else. Measured on 156.0.8078.80
+// against 155.0.8059.84 through one local recorder: the ClientHello, the
+// HTTP/2 SETTINGS, WINDOW_UPDATE and HEADERS frames, and the header order and
+// Accept values were identical.
+// Falls back to Chrome155Windows if the JSON didn't load.
+func Chrome156Windows() *Preset {
+	if p := LookupCustom("chrome-156-windows"); p != nil {
+		return p
+	}
+	return Chrome155Windows()
+}
+
+// Chrome156Linux returns Chrome 156 on Linux. See Chrome156Windows.
+func Chrome156Linux() *Preset {
+	if p := LookupCustom("chrome-156-linux"); p != nil {
+		return p
+	}
+	return Chrome155Linux()
+}
+
+// Chrome156macOS returns Chrome 156 on macOS. See Chrome156Windows.
+func Chrome156macOS() *Preset {
+	if p := LookupCustom("chrome-156-macos"); p != nil {
+		return p
+	}
+	return Chrome155macOS()
+}
+
+// Chrome156 returns the Chrome 156 fingerprint preset auto-detected from the
+// running OS.
+func Chrome156() *Preset {
+	switch GetPlatformInfo().Platform {
+	case "Windows":
+		return Chrome156Windows()
+	case "macOS":
+		return Chrome156macOS()
+	default:
+		return Chrome156Linux()
+	}
+}
+
+// AndroidChrome156 returns Chrome 156 on Android. Falls back to AndroidChrome155.
+func AndroidChrome156() *Preset {
+	if p := LookupCustom("chrome-156-android"); p != nil {
+		return p
+	}
+	return AndroidChrome155()
+}
+
+// Chrome157Windows returns Chrome 157 on Windows. Headers-only over 156, like
+// 156 over 155. Measured on 157.0.8103.50 against 156.0.8078.80 the same way.
+// Falls back to Chrome156Windows if the JSON didn't load.
+func Chrome157Windows() *Preset {
+	if p := LookupCustom("chrome-157-windows"); p != nil {
+		return p
+	}
+	return Chrome156Windows()
+}
+
+// Chrome157Linux returns Chrome 157 on Linux. See Chrome157Windows.
+func Chrome157Linux() *Preset {
+	if p := LookupCustom("chrome-157-linux"); p != nil {
+		return p
+	}
+	return Chrome156Linux()
+}
+
+// Chrome157macOS returns Chrome 157 on macOS. See Chrome157Windows.
+func Chrome157macOS() *Preset {
+	if p := LookupCustom("chrome-157-macos"); p != nil {
+		return p
+	}
+	return Chrome156macOS()
+}
+
+// Chrome157 returns the Chrome 157 fingerprint preset auto-detected from the
+// running OS.
+func Chrome157() *Preset {
+	switch GetPlatformInfo().Platform {
+	case "Windows":
+		return Chrome157Windows()
+	case "macOS":
+		return Chrome157macOS()
+	default:
+		return Chrome157Linux()
+	}
+}
+
+// AndroidChrome157 returns Chrome 157 on Android. Falls back to AndroidChrome156.
+func AndroidChrome157() *Preset {
+	if p := LookupCustom("chrome-157-android"); p != nil {
+		return p
+	}
+	return AndroidChrome156()
+}
+
+// Chrome158Windows returns Chrome 158 on Windows. Headers-only over 157, like
+// 157 over 156. Measured on 158.0.8127.18 (the Windows stable rollout build)
+// against 157.0.8103.50 the same way.
+// Falls back to Chrome157Windows if the JSON didn't load.
+func Chrome158Windows() *Preset {
+	if p := LookupCustom("chrome-158-windows"); p != nil {
+		return p
+	}
+	return Chrome157Windows()
+}
+
+// Chrome158Linux returns Chrome 158 on Linux. See Chrome158Windows.
+func Chrome158Linux() *Preset {
+	if p := LookupCustom("chrome-158-linux"); p != nil {
+		return p
+	}
+	return Chrome157Linux()
+}
+
+// Chrome158macOS returns Chrome 158 on macOS. See Chrome158Windows.
+func Chrome158macOS() *Preset {
+	if p := LookupCustom("chrome-158-macos"); p != nil {
+		return p
+	}
+	return Chrome157macOS()
+}
+
+// Chrome158 returns the Chrome 158 fingerprint preset auto-detected from the
+// running OS.
+func Chrome158() *Preset {
+	switch GetPlatformInfo().Platform {
+	case "Windows":
+		return Chrome158Windows()
+	case "macOS":
+		return Chrome158macOS()
+	default:
+		return Chrome158Linux()
+	}
+}
+
+// AndroidChrome158 returns Chrome 158 on Android. Falls back to AndroidChrome157.
+func AndroidChrome158() *Preset {
+	if p := LookupCustom("chrome-158-android"); p != nil {
+		return p
+	}
+	return AndroidChrome157()
+}
+
 // There is deliberately no IOSChrome153 or IOSChrome154. The CriOS User-Agent
 // carries a full build number (152 was 152.0.7977.64) that no rule derives
 // from the major version, and shipping a preset whose UA names the wrong build
@@ -3637,6 +3790,48 @@ func IOSSafari18() *Preset {
 		H3Config:       safariH3Config(),
 		SupportHTTP3:   true,
 	}
+}
+
+// IOSSafari26 returns the Safari 26 iOS HTTP/2 fingerprint, captured from
+// Safari 26.6.1 on 2026-10-19. The UA reports the frozen iPhone OS 18_7 value.
+// TLS stays HelloIOS_18: JA3 ecdf4f49dd59effc439639da29186671 and Peetprint
+// 62b834de729e78a9f0ebd1dd099314a7 already match. See the sanitized capture
+// in testdata/safari-26-ios-capture.json. Locale remains the library's en-US
+// default; the capture's en-AU preference is a caller override.
+func IOSSafari26() *Preset {
+	p := IOSSafari18()
+	p.Name = "safari-26-ios"
+	p.UserAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 18_7 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.6.1 Mobile/15E148 Safari/604.1"
+	delete(p.Headers, "Sec-Fetch-User")
+	p.Headers["Accept-Encoding"] = "gzip, deflate, br, zstd"
+	p.Headers["Priority"] = "u=0, i"
+	p.HeaderOrder = []HeaderPair{
+		{"sec-fetch-dest", "document"}, {"user-agent", ""},
+		{"accept", p.Headers["Accept"]}, {"sec-fetch-site", "none"},
+		{"sec-fetch-mode", "navigate"}, {"accept-language", p.Headers["Accept-Language"]},
+		{"priority", "u=0, i"}, {"accept-encoding", p.Headers["Accept-Encoding"]},
+	}
+	p.HTTP2Settings.ConnectionWindowUpdate = 10420225
+	p.HTTP2Settings.MaxFrameSize = 0 // Do not advertise SETTINGS_MAX_FRAME_SIZE.
+	p.HTTP2Settings.StreamWeight = 0 // No legacy PRIORITY data on HEADERS.
+	p.H2Config = safariH2Config()
+	p.H2Config.SettingsOrder = []uint16{2, 3, 4, 9}
+	p.H2Config.PseudoHeaderOrder = []string{":method", ":scheme", ":authority", ":path"}
+	p.H2Config.HPACKHeaderOrder = []string{
+		"sec-fetch-dest", "user-agent", "accept", "sec-fetch-site", "sec-fetch-mode",
+		"accept-language", "priority", "accept-encoding",
+		"referer", "cookie", "content-type", "content-length", "origin",
+	}
+	// The capture is HTTP/2 only, so nothing says Safari puts priority on an
+	// HTTP/1.1 request, and safari-18-ios, which the iOS aliases named before,
+	// never sent one there. Same WebKit stack, same answer as iOS Chrome.
+	noH1Priority := false
+	p.H2Config.PriorityOverHTTP1 = &noH1Priority
+	// The capture is HTTP/2 only, so HTTP/3 stays off by default. H3Config is
+	// kept: a caller who forces HTTP/3 must still get Safari's QUIC shape,
+	// since a nil config falls back to Chrome's (the #125 mismatch).
+	p.SupportHTTP3 = false
+	return p
 }
 
 // AndroidChrome143 returns Chrome 143 on Android fingerprint preset
@@ -3954,6 +4149,7 @@ var presets = map[string]func() *Preset{
 	"chrome-146-ios":      IOSChrome146,
 	"safari-17-ios":       IOSSafari17,
 	"safari-18-ios":       IOSSafari18,
+	"safari-26-ios":       IOSSafari26,
 	"chrome-143-android":  AndroidChrome143,
 	"chrome-144-android":  AndroidChrome144,
 	"chrome-145-android":  AndroidChrome145,
@@ -3998,6 +4194,21 @@ var presets = map[string]func() *Preset{
 	"chrome-155-macos":    Chrome155macOS,
 	"chrome-155-ios":      IOSChrome155,
 	"chrome-155-android":  AndroidChrome155,
+	"chrome-156":          Chrome156,
+	"chrome-156-windows":  Chrome156Windows,
+	"chrome-156-linux":    Chrome156Linux,
+	"chrome-156-macos":    Chrome156macOS,
+	"chrome-156-android":  AndroidChrome156,
+	"chrome-157":          Chrome157,
+	"chrome-157-windows":  Chrome157Windows,
+	"chrome-157-linux":    Chrome157Linux,
+	"chrome-157-macos":    Chrome157macOS,
+	"chrome-157-android":  AndroidChrome157,
+	"chrome-158":          Chrome158,
+	"chrome-158-windows":  Chrome158Windows,
+	"chrome-158-linux":    Chrome158Linux,
+	"chrome-158-macos":    Chrome158macOS,
+	"chrome-158-android":  AndroidChrome158,
 	"chrome-151":          Chrome151,
 	"chrome-151-windows":  Chrome151Windows,
 	"chrome-151-linux":    Chrome151Linux,
@@ -4005,22 +4216,23 @@ var presets = map[string]func() *Preset{
 	"chrome-151-ios":      IOSChrome151,
 	"chrome-151-android":  AndroidChrome151,
 
-	// -latest aliases (always point to the newest version). All of Chrome
-	// tracks 155. iOS only moves when a capture lands, because the iOS
-	// User-Agent carries a full build number that cannot be derived from the
-	// major version (see the note above IOSChrome143).
-	"chrome-latest":          Chrome155,
-	"chrome-latest-windows":  Chrome155Windows,
-	"chrome-latest-linux":    Chrome155Linux,
-	"chrome-latest-macos":    Chrome155macOS,
+	// -latest aliases (always point to the newest version). Desktop and
+	// Android Chrome track 158; iOS stays on 155. iOS only moves when a
+	// capture lands, because the iOS User-Agent carries a full build number
+	// that cannot be derived from the major version (see the note above
+	// IOSChrome143).
+	"chrome-latest":          Chrome158,
+	"chrome-latest-windows":  Chrome158Windows,
+	"chrome-latest-linux":    Chrome158Linux,
+	"chrome-latest-macos":    Chrome158macOS,
 	"firefox-latest":         Firefox148,
 	"firefox-latest-windows": Firefox148Windows,
 	"firefox-latest-linux":   Firefox148Linux,
 	"firefox-latest-macos":   Firefox148macOS,
 	"safari-latest":          Safari18,
 	"chrome-latest-ios":      IOSChrome155,
-	"safari-latest-ios":      IOSSafari18,
-	"chrome-latest-android":  AndroidChrome155,
+	"safari-latest-ios":      IOSSafari26,
+	"chrome-latest-android":  AndroidChrome158,
 
 	// Backwards compatibility aliases (old naming convention). The -latest
 	// ones follow chrome-latest-ios and chrome-latest-android; they were left
@@ -4033,6 +4245,7 @@ var presets = map[string]func() *Preset{
 	"ios-chrome-148":        IOSChrome148,
 	"ios-safari-17":         IOSSafari17,
 	"ios-safari-18":         IOSSafari18,
+	"ios-safari-26":         IOSSafari26,
 	"android-chrome-143":    AndroidChrome143,
 	"android-chrome-144":    AndroidChrome144,
 	"android-chrome-145":    AndroidChrome145,
@@ -4040,8 +4253,8 @@ var presets = map[string]func() *Preset{
 	"android-chrome-147":    AndroidChrome147,
 	"android-chrome-148":    AndroidChrome148,
 	"ios-chrome-latest":     IOSChrome155,
-	"ios-safari-latest":     IOSSafari18,
-	"android-chrome-latest": AndroidChrome155,
+	"ios-safari-latest":     IOSSafari26,
+	"android-chrome-latest": AndroidChrome158,
 }
 
 // Get returns a preset by name. Checks custom registry first, then built-in

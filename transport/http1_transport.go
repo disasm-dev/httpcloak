@@ -292,6 +292,9 @@ func (t *HTTP1Transport) SetLocalAddr(addr string) {
 
 // RoundTrip implements http.RoundTripper
 func (t *HTTP1Transport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if err := validateH1Request(req); err != nil {
+		return nil, err
+	}
 	t.closedMu.RLock()
 	if t.closed {
 		t.closedMu.RUnlock()
@@ -404,6 +407,10 @@ func (t *HTTP1Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 // allowing the TLS connection to be reused instead of creating a new one.
 // The connection will be closed after the request (not pooled) since it came from H2 transport.
 func (t *HTTP1Transport) RoundTripWithTLSConn(req *http.Request, tlsConn *utls.UConn, host, port string) (*http.Response, error) {
+	if err := validateH1Request(req); err != nil {
+		tlsConn.Close()
+		return nil, err
+	}
 	t.closedMu.RLock()
 	if t.closed {
 		t.closedMu.RUnlock()
@@ -553,6 +560,9 @@ func (w *streamBodyWrapper) Close() error {
 // StreamRoundTrip performs an HTTP request for streaming - connection is NOT pooled
 // The connection will be closed when the response body is closed
 func (t *HTTP1Transport) StreamRoundTrip(req *http.Request) (*http.Response, error) {
+	if err := validateH1Request(req); err != nil {
+		return nil, err
+	}
 	t.closedMu.RLock()
 	if t.closed {
 		t.closedMu.RUnlock()
@@ -1261,7 +1271,13 @@ func canonicalHeaderKey(s string) string {
 // Go's canonical form (Sec-Ch-Ua) diverges from Chrome's lowercase, so we map it
 // back here. The argument is the canonical map key; the value lookup still uses
 // the canonical key.
+//
+// Do Not Track is the other name Go's canonical form gets wrong: Chrome and
+// Firefox both send DNT, and a page cannot set it, so no browser sends Dnt.
 func h1WireHeaderName(canonicalKey string) string {
+	if canonicalKey == "Dnt" {
+		return "DNT"
+	}
 	lower := strings.ToLower(canonicalKey)
 	if strings.HasPrefix(lower, "sec-ch-") {
 		return lower
@@ -1920,4 +1936,54 @@ func (t *HTTP1Transport) applyH1Spec(
 		return nil, err
 	}
 	return conn, nil
+}
+
+// validateH1Request refuses a request the HTTP/1.1 writer would put on the wire
+// as something else. The writer prints the method, target, Host and every
+// header verbatim, so a CR or LF in any of them ends the line early and the
+// rest is read as headers of the caller's choosing, or as a second request.
+// Chrome, Go's own client and this library's HTTP/2 and HTTP/3 paths all
+// refuse such requests; this brings HTTP/1.1 in line.
+//
+// Only CR, LF and NUL are refused, the bytes that can end or truncate a line.
+// Anything else 1.7.3 sent, it still sends: a header name that is not a
+// token (a ':path' copied from DevTools, which the auto-mode HTTP/1.1
+// fallback relies on), a raw space in the query, obs-text in a value. Lenient
+// servers accept those, and refusing them broke requests that worked.
+// Bookkeeping entries (header order, casing, the exact-headers marker) never
+// reach the wire and are skipped.
+func validateH1Request(req *http.Request) error {
+	if hasLineBreak(req.Method) {
+		return fmt.Errorf("invalid HTTP method %q", req.Method)
+	}
+	if req.URL != nil && hasLineBreak(req.URL.RequestURI()) {
+		return fmt.Errorf("invalid request target %q", req.URL.RequestURI())
+	}
+	host := req.Host
+	if host == "" && req.URL != nil {
+		host = req.URL.Host
+	}
+	if hasLineBreak(host) {
+		return fmt.Errorf("invalid Host header %q", host)
+	}
+	for key, values := range req.Header {
+		switch key {
+		case http.HeaderOrderKey, http.PHeaderOrderKey, h1HeaderCasingKey, exactHeadersKey:
+			continue
+		}
+		if hasLineBreak(key) {
+			return fmt.Errorf("invalid header field name %q", key)
+		}
+		for _, v := range values {
+			if hasLineBreak(v) {
+				return fmt.Errorf("invalid header field value for %q", key)
+			}
+		}
+	}
+	return nil
+}
+
+// hasLineBreak reports whether s holds a CR, LF or NUL.
+func hasLineBreak(s string) bool {
+	return strings.ContainsAny(s, "\r\n\x00")
 }

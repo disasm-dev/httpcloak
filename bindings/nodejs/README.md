@@ -384,9 +384,9 @@ const session = new Session({
 const { availablePresets } = require("httpcloak");
 
 console.log(availablePresets());
-// ['chrome-latest', 'chrome-155', 'chrome-155-windows', 'chrome-155-android', 'chrome-154',
+// ['chrome-latest', 'chrome-158', 'chrome-158-windows', 'chrome-158-android', 'chrome-157',
 //  ..., 'chrome-155-ios', 'firefox-148', 'safari-18', ...]
-// Desktop and Android Chrome go up to 155 (Android has no 149); iOS Chrome has 143 to 148, 150 to 152, and 155.
+// Desktop and Android Chrome go up to 158 (Android has no 149); iOS Chrome has 143 to 148, 150 to 152, and 155.
 ```
 
 ## Response Object
@@ -643,6 +643,7 @@ const proxy = new LocalProxy({
   tcpProxy: null,       // Default upstream TCP proxy
   udpProxy: null,       // Default upstream UDP proxy
   tlsOnly: false,       // TLS-only mode
+  verify: true,         // Check the certificates of the sites it connects to (false for self-signed test servers)
 });
 
 proxy.port;           // Actual port number
@@ -654,9 +655,11 @@ proxy.close();        // Stop the proxy
 
 ## Platform Support
 
-- Linux (x64, arm64)
-- macOS (x64, arm64)
-- Windows (x64, arm64)
+- Linux (x64, arm64), glibc 2.17 or later
+- macOS 12 or later (x64, arm64)
+- Windows 10 or later (x64)
+
+Alpine and other musl systems aren't supported yet.
 - Node.js 16+
 
 ## License

@@ -14,8 +14,8 @@ require (
 	github.com/klauspost/compress v1.18.2
 	github.com/miekg/dns v1.1.69
 	github.com/sardanioss/http v1.2.0
-	github.com/sardanioss/net v1.2.12
-	github.com/sardanioss/quic-go v1.2.30
+	github.com/sardanioss/net v1.2.14
+	github.com/sardanioss/quic-go v1.2.31
 	github.com/sardanioss/udpbara v1.1.0
 	github.com/sardanioss/utls v1.10.5
 	golang.org/x/net v0.48.0
@@ -35,7 +35,7 @@ require (
 // the module that declares it, so a project using this fork needs the same
 // three in its own go.mod (see README).
 replace (
-	github.com/sardanioss/net => github.com/disasm-dev/net v1.2.1200
-	github.com/sardanioss/quic-go => github.com/disasm-dev/quic-go v1.2.3000
+	github.com/sardanioss/net => ../httpcloak-forks/net
+	github.com/sardanioss/quic-go => ../httpcloak-forks/quic-go
 	github.com/sardanioss/utls => github.com/disasm-dev/utls v1.10.500
 )

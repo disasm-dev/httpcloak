@@ -2,10 +2,6 @@ github.com/andybalholm/brotli v1.2.0 h1:ukwgCxwYrmACq68yiUqwIWnGY0cTPox/M94sVwTo
 github.com/andybalholm/brotli v1.2.0/go.mod h1:rzTDkvFWvIrjDXZHkuS16NPggd91W3kUSvPlQ1pLaKY=
 github.com/davecgh/go-spew v1.1.1 h1:vj9j/u1bqnvCEfJOwUhtlOARqs3+rkHYY13jYWTU97c=
 github.com/davecgh/go-spew v1.1.1/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
-github.com/disasm-dev/net v1.2.1200 h1:JI/ld/8XRC1pukLsVX58AaXFX4WWnQxU8yzxG8Vs1VE=
-github.com/disasm-dev/net v1.2.1200/go.mod h1:BH4SOxKg5Cf0psT5htTmI7YVBXPsA+TF20Hb7glnLYA=
-github.com/disasm-dev/quic-go v1.2.3000 h1:/AIHAzYlY80f7q/oJRyo/SVkySJP1TzyCTQbtNJcFaQ=
-github.com/disasm-dev/quic-go v1.2.3000/go.mod h1:ghWvKi2F6gfY7nm/iT7eNV9Of3SUF7fgKf/1SGBA8PA=
 github.com/disasm-dev/utls v1.10.500 h1:KHXuE1vylzH3LZlMdGdmuSkGGSZe4QaTi75g7W8W7Zw=
 github.com/disasm-dev/utls v1.10.500/go.mod h1:3sXK05Ir31HiMGINYV1uMDFRv/z9JL+QY9ITi/WEbV0=
 github.com/google/go-cmp v0.6.0 h1:ofyhxvXcZhMsU5ulbFiLKl/XBFqE1GSq7atu8tAmTRI=

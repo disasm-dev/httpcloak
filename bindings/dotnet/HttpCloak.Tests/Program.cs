@@ -22,9 +22,19 @@ if (testArg == "proxy")
     return;
 }
 
+if (testArg == "headers")
+{
+    Environment.Exit(TestHeaderSpelling.Run() ? 0 : 1);
+}
+
 if (testArg == "cache")
 {
     Environment.Exit(await TestSessionCache.RunAsync() ? 0 : 1);
+}
+
+if (testArg == "gcstress")
+{
+    Environment.Exit(await TestGcStress.RunAsync(cmdArgs) ? 0 : 1);
 }
 
 Console.WriteLine(new string('=', 70));
