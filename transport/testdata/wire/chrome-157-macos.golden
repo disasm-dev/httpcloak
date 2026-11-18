@@ -410,6 +410,7 @@ DATA len=7
       ],
       "hpack_header_order": [
         "cache-control",
+        "sec-ch-device-memory",
         "sec-ch-ua",
         "sec-ch-ua-arch",
         "sec-ch-ua-bitness",
@@ -444,6 +445,7 @@ DATA len=7
         "sec-ch-ua-platform",
         "sec-ch-ua-platform-version",
         "user-agent",
+        "sec-ch-device-memory",
         "sec-ch-ua",
         "sec-ch-ua-arch",
         "sec-ch-ua-bitness",
